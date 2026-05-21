@@ -277,7 +277,7 @@ class Skill:
 
 @dataclass
 class AgentProfile:
-    """Agent profile for skill-aware orchestration."""
+    """Agent profile with per-skill competence and cost statistics."""
 
     agent_id: str = ""
     mode: str = ""

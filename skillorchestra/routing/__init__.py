@@ -1,1 +1,1 @@
-"""Deployment-time orchestration using the Skill Handbook (paper Section 4.1)."""
+"""Deployment-time model routing using the Skill Handbook."""

@@ -14,10 +14,7 @@ from ..core.handbook import SkillHandbook
 from ..core.traces import ExplorationBundle, ExecutionTrace
 from ..core.types import Skill, SkillProvenance
 from ..llm.client import LLMClient
-from skillorchestra.prompts.learning import (
-    SKILL_DISCOVERY_PROMPT,
-    AGENT_ORCHESTRATION_DISCOVERY_PROMPT,
-)
+from skillorchestra.prompts.learning import SKILL_DISCOVERY_PROMPT
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +24,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 class DiscoveredSkill(BaseModel):
-    """Model routing: skill_id, mode. Agent orchestration: id (stage/mode in category)."""
+    """Model routing: skill_id, mode."""
     skill_id: str = ""
     id: str = ""
     name: str = ""
@@ -38,7 +35,7 @@ class DiscoveredSkill(BaseModel):
 
 
 class DiscoveredCategory(BaseModel):
-    """Model routing: name. Agent orchestration: stage/mode, name."""
+    """Model routing: name."""
     stage: str = ""
     name: str = ""
     description: str = ""
@@ -71,13 +68,8 @@ class SkillDiscoverer:
         bundles: List[ExplorationBundle],
         handbook: SkillHandbook,
         modes: Optional[List[str]] = None,
-        prompt_type: str = "model_routing",
     ) -> List[Skill]:
         """Discover skills from exploration bundles.
-
-        prompt_type: "model_routing" (default) or "agent_orchestration"
-        - model_routing: Uses SKILL_DISCOVERY_PROMPT with contrastive evidence
-        - agent_orchestration: Uses AGENT_ORCHESTRATION_DISCOVERY_PROMPT
 
         Returns:
             List of newly discovered Skill objects
@@ -94,12 +86,11 @@ class SkillDiscoverer:
             target_modes = sorted(all_modes)
 
         new_skills: List[Skill] = []
-        use_agent_orchestration = prompt_type == "agent_orchestration"
 
         for mode in target_modes:
             logger.info(
                 f"  Mode '{mode}': {len(bundles)} queries, "
-                f"generating taxonomy ({prompt_type})..."
+                f"generating taxonomy..."
             )
 
             self.llm.set_role("skill_discoverer")
@@ -108,7 +99,7 @@ class SkillDiscoverer:
             for size_idx, bundle_count in enumerate(bundle_sizes):
                 cur_bundles = bundles[:bundle_count]
                 prompt = self._build_discovery_prompt(
-                    cur_bundles, mode, handbook, use_agent_orchestration
+                    cur_bundles, mode, handbook
                 )
                 logger.info(
                     f"  Mode '{mode}': discovery prompt uses {bundle_count}/{len(bundles)} queries"
@@ -157,11 +148,11 @@ class SkillDiscoverer:
             logger.info(f"  Mode '{mode}': LLM proposed {total_cat} categories, {total_sk} skills")
 
             for cat in output.categories:
-                skill_mode = (cat.stage or mode) if use_agent_orchestration else mode
+                skill_mode = mode
 
                 logger.info(f"    Category: {cat.name} ({skill_mode}) -- {cat.description[:80]}")
                 for ds in cat.skills:
-                    sid = (ds.id or ds.name) if use_agent_orchestration else (ds.skill_id or ds.name)
+                    sid = ds.skill_id or ds.name
                     if sid in handbook.skills:
                         logger.debug(f"    Skipping duplicate: {sid}")
                         continue
@@ -195,12 +186,7 @@ class SkillDiscoverer:
         bundles: List[ExplorationBundle],
         mode: str,
         handbook: SkillHandbook,
-        use_agent_orchestration: bool,
     ) -> str:
-        if use_agent_orchestration:
-            problems_text = self._format_problems_agent_orchestration(bundles, mode)
-            return AGENT_ORCHESTRATION_DISCOVERY_PROMPT.format(sample_problems=problems_text)
-
         problems_text = self._format_problems(bundles, mode)
         contrastive_text = self._format_contrastive_evidence(bundles, mode)
         existing_skills = self._format_existing_skills(handbook, mode)
@@ -260,28 +246,6 @@ class SkillDiscoverer:
                 label = "CORRECT" if trace.task_success else "WRONG"
                 answer = trace.final_answer or "(no answer)"
                 parts.append(f"  {trace.varied_agent_id} [{label}]: {answer}")
-
-            parts.append("")
-
-        return "\n".join(parts) if parts else "(no data for this mode)"
-
-    def _format_problems_agent_orchestration(self, bundles: List[ExplorationBundle], mode: str) -> str:
-        """Format problems for agent orchestration."""
-        parts = []
-        for i, bundle in enumerate(bundles):
-            traces = bundle.get_trajectories_for_mode(mode)
-            gt = ", ".join(bundle.ground_truths[:3]) if bundle.ground_truths else "N/A"
-
-            parts.append(f"**Problem {i + 1}:**")
-            parts.append(bundle.query[:500])
-            parts.append(f"**Answer:** {gt[:300]}")
-
-            if traces:
-                outcomes = ", ".join(
-                    f"{t.varied_agent_id} {'✓' if t.task_success else '✗'}"
-                    for t in traces
-                )
-                parts.append(f"**Model outcomes:** {outcomes}")
 
             parts.append("")
 

@@ -52,45 +52,6 @@ Usage examples:
       --phases learn,select \\
       --no-llm
 
-  # --- Frames (agent orchestration) ---
-
-  # Full pipeline (explore → learn → select → test)
-  python scripts/pipeline.py frames \\
-      --output-dir /tmp/so_pipeline/frames \\
-      --eval-script orchestration/eval_frames.py \\
-      --test-samples data/frames_test.jsonl
-
-  # Full pipeline with explicit train/val split (20 train, 20 val)
-  python scripts/pipeline.py frames \\
-      --output-dir /tmp/so_pipeline/frames \\
-      --eval-script orchestration/eval_frames.py \\
-      --test-samples data/frames_test.jsonl \\
-      --exploration-samples 40 \\
-      --train-samples 20 \\
-      --val-samples 20
-
-  # Generate exploration only
-  python scripts/pipeline.py frames \\
-      --output-dir /tmp/so_pipeline/frames \\
-      --eval-script orchestration/eval_frames.py \\
-      --phases explore
-
-  # Use existing exploration data, run learn + select (20 train, 20 val)
-  python scripts/pipeline.py frames \\
-      --output-dir /tmp/so_pipeline/frames \\
-      --exploration-data /path/to/exploration \\
-      --eval-script orchestration/eval_frames.py \\
-      --phases learn,select \\
-      --train-samples 20 \\
-      --val-samples 20
-
-  # Use existing exploration data, run learn + select + test
-  python scripts/pipeline.py frames \\
-      --output-dir /tmp/so_pipeline/frames \\
-      --exploration-data /path/to/exploration \\
-      --eval-script orchestration/eval_frames.py \\
-      --test-samples data/frames_test.jsonl \\
-      --phases learn,select,test
 """
 
 from __future__ import annotations
@@ -118,31 +79,20 @@ load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 from config import resolve_model
 from config.pipeline import (
     DATA_DIR,
-    DEFAULT_EVAL_SCRIPT,
-    DEFAULT_FRAMES_POOL_MODELS,
     DEFAULT_MODEL_CONFIG,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_POOL_MODELS,
-    DEFAULT_SEARCH_MODELS,
-    DEFAULT_CODE_MODELS,
-    DEFAULT_ANSWER_MODELS,
-    FRAMES_EXPLORATION_DIR,
-    FRAMES_SAMPLES_PATH,
-    FRAMES_TEST_PATH,
     RSL_RESULTS_DIR,
 )
 from skillorchestra.core.handbook import SkillHandbook
 from skillorchestra.core.traces import ExplorationBundle
 from skillorchestra.converters.from_ar import load_rsl_results, rsl_stats, find_rsl_results
-from skillorchestra.converters.from_stage_router import load_exploration_dataset, exploration_stats
 from skillorchestra.converters.to_ar import save_as_rsl
-from skillorchestra.converters.to_stage_router import save_as_stage_router
 from skillorchestra.selection.candidates import (
     CandidateHandbook,
     generate_depth_candidates,
     compute_mode_max_depths,
 )
-from skillorchestra.selection.live_eval import LiveEvaluator, LiveEvalConfig
 from skillorchestra.selection.pareto import (
     EvaluationResult,
     evaluate_candidate_oracle,
@@ -191,14 +141,14 @@ def _setup_log_file(output_dir: Path) -> None:
 class PipelineConfig:
     """Unified configuration for the full pipeline."""
 
-    task_type: str = "model-routing"  # "model-routing" or "frames"
+    task_type: str = "model-routing"
     output_dir: str = ""  # default: output/ in repo
     phases: List[str] = field(default_factory=lambda: ["explore", "learn", "select", "test"])
 
     # Exploration
-    dataset: str = ""  # e.g., "nq_validation_qwen" or path to frames_train.jsonl (FRAMES)
+    dataset: str = ""  # e.g., "nq_validation_qwen"
     exploration_data: Optional[str] = None  # path to existing exploration data
-    samples_path: Optional[str] = None  # for FRAMES: path to frames_train.jsonl
+    samples_path: Optional[str] = None
     max_train_samples: Optional[int] = None
     exploration_epochs: int = 1
     exploration_samples: Optional[int] = None
@@ -210,10 +160,7 @@ class PipelineConfig:
     router_model: str = "qwen2.5-3b-instruct"
     distributed_config: Optional[str] = None
 
-    # FRAMES specific
-    orchestrator: str = "Qwen/Qwen3-8B"
     model_config: str = str(DEFAULT_MODEL_CONFIG)
-    eval_script: Optional[str] = None  # Path to eval_frames.py (required for explore/test)
     concurrency: int = 20
     tool_concurrency: int = 10
     max_rounds: int = 20
@@ -240,7 +187,7 @@ class PipelineConfig:
 
     # Testing
     test_dataset: Optional[str] = None  # model routing: e.g. "nq_test_qwen"
-    test_samples: Optional[str] = None  # FRAMES: path to test samples JSONL
+    test_samples: Optional[str] = None  # Path to test samples JSONL
     test_max_samples: Optional[int] = None
     handbook_path: Optional[str] = None  # Override: path to handbook JSON (or dir with handbook.json) for test phase
 
@@ -335,149 +282,6 @@ def phase_explore_model_routing(config: PipelineConfig) -> Path:
     raise FileNotFoundError(f"No inference_results.jsonl found in {explore_dir}")
 
 
-def phase_explore_frames(config: PipelineConfig) -> Path:
-    """Generate exploration data for FRAMES by calling eval_frames.py with forced models."""
-    logger.info("=" * 60)
-    logger.info("Phase 0: Exploration (FRAMES)")
-    logger.info("=" * 60)
-
-    if config.exploration_data:
-        p = Path(config.exploration_data)
-        if p.exists():
-            logger.info(f"Using existing exploration data: {p}")
-            return p
-
-    # Skip existing exploration when doing a restricted test (stages/models/samples)
-    force_fresh = config.exploration_stages or config.exploration_models or config.exploration_samples
-    if not force_fresh and FRAMES_EXPLORATION_DIR.exists():
-        logger.info(f"Found existing FRAMES exploration: {FRAMES_EXPLORATION_DIR}")
-        return FRAMES_EXPLORATION_DIR
-
-    if not config.eval_script or not Path(config.eval_script).exists():
-        raise RuntimeError(
-            "Explore phase requires --eval-script pointing to eval_frames.py. "
-            "Use --phases learn,select with existing exploration in raw_data/exploration_100"
-        )
-
-    explore_dir = (Path(config.output_dir) / "exploration").resolve()
-    explore_dir.mkdir(parents=True, exist_ok=True)
-
-    # Use samples_100 for exploration/learning; frames.jsonl is for testing only
-    dataset_file = config.dataset or str(FRAMES_SAMPLES_PATH)
-    if not Path(dataset_file).is_absolute():
-        dataset_file = str(Path(dataset_file).resolve())
-
-    # Optionally create a small subset for quick testing
-    if config.exploration_samples:
-        subset_path = explore_dir / "samples.jsonl"
-        source_path = dataset_file
-        with open(dataset_file) as src, open(subset_path, "w") as dst:
-            for i, line in enumerate(src):
-                if i >= config.exploration_samples:
-                    break
-                dst.write(line)
-        dataset_file = str(subset_path.resolve())
-        logger.info(
-            f"Using first {config.exploration_samples} samples from {source_path} -> {subset_path}"
-        )
-    # Always set samples_path to match exploration output for correct bundle loading
-    config.samples_path = str(explore_dir / "samples.jsonl")
-    if not Path(config.samples_path).exists():
-        import shutil
-        shutil.copy(dataset_file, config.samples_path)
-        logger.info(f"Copied dataset to {config.samples_path} for bundle loading")
-
-    models_to_explore = {
-        "search": DEFAULT_SEARCH_MODELS,
-        "code": DEFAULT_CODE_MODELS,
-        "answer": DEFAULT_ANSWER_MODELS,
-    }
-    defaults = {
-        "search": DEFAULT_SEARCH_MODELS[0],
-        "code": DEFAULT_CODE_MODELS[0],
-        "answer": DEFAULT_ANSWER_MODELS[0],
-    }
-
-    stages = config.exploration_stages or list(models_to_explore.keys())
-    runs = []
-    for stage, model_list in models_to_explore.items():
-        if stage not in stages:
-            continue
-        if config.exploration_models:
-            model_list = [m for m in model_list if m in config.exploration_models]
-            if not model_list:
-                continue
-        for model_id in model_list:
-            runs.append((stage, model_id))
-
-    logger.info(
-        f"Exploration: {len(runs)} runs (stage/model), "
-        f"{config.concurrency} samples in parallel, "
-        f"{config.tool_concurrency} tool calls/sample"
-    )
-    try:
-        from tqdm import tqdm
-        run_iter = tqdm(runs, desc="Stage/model", unit="run")
-    except ImportError:
-        run_iter = runs
-
-    repo_root = Path(__file__).resolve().parent.parent
-    eval_script_path = (repo_root / config.eval_script).resolve() if not Path(config.eval_script).is_absolute() else Path(config.eval_script).resolve()
-    eval_script_dir = str(eval_script_path.parent)
-
-    for stage, model_id in run_iter:
-        stage_dir = explore_dir / stage / model_id
-        stage_dir.mkdir(parents=True, exist_ok=True)
-
-        cmd = [
-            sys.executable, str(eval_script_path),
-            "--example_file_path", dataset_file,
-            "--output_dir", str(stage_dir),
-            "--model_config", config.model_config,
-            "--model_name", config.orchestrator,
-            "--model_type", config.orchestrator,
-            "--max_rounds", str(config.max_rounds),
-            "--concurrency", str(config.concurrency),
-            "--tool_concurrency", str(config.tool_concurrency),
-        ]
-
-        force_args = {
-            "search": "--force_search_model",
-            "code": "--force_reasoning_model",
-            "answer": "--force_answer_model",
-        }
-
-        if stage == "search":
-            cmd += [force_args["search"], model_id]
-            cmd += [force_args["code"], defaults["code"]]
-            cmd += [force_args["answer"], defaults["answer"]]
-        elif stage == "code":
-            cmd += [force_args["search"], defaults["search"]]
-            cmd += [force_args["code"], model_id]
-            cmd += [force_args["answer"], defaults["answer"]]
-        elif stage == "answer":
-            cmd += [force_args["search"], defaults["search"]]
-            cmd += [force_args["code"], defaults["code"]]
-            cmd += [force_args["answer"], model_id]
-
-        if hasattr(run_iter, "set_postfix_str"):
-            run_iter.set_postfix_str(f"{stage}/{model_id}")
-        logger.info(f"Exploring {stage}/{model_id}...")
-        env = os.environ.copy()
-        env["REPO_PATH"] = str(repo_root / "orchestration")
-        existing_pythonpath = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = str(repo_root) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
-        # Don't capture output so eval_frames progress bar is visible
-        result = subprocess.run(
-            cmd, cwd=eval_script_dir, env=env,
-            capture_output=False, text=True, timeout=7200,
-        )
-        if result.returncode != 0:
-            logger.warning(f"Exploration {stage}/{model_id} failed (exit code {result.returncode})")
-
-    logger.info(f"Exploration complete: {explore_dir}")
-    return explore_dir
-
 
 # ===========================================================================
 # Phase 1: Learning
@@ -516,27 +320,19 @@ def _learn_with_llm(
     else:
         llm = LLMClient(model=config.llm_model)
 
-    discovery_prompt = "agent_orchestration" if config.task_type == "frames" else "model_routing"
     lconfig = LearningConfig(
         validation_ratio=0.5,
         max_refinement_rounds=config.max_refinement_rounds,
         max_merge_credits=config.max_merge_credits,
         max_split_credits=config.max_split_credits,
         max_discovery_bundles=config.max_discovery_bundles,
-        discovery_prompt_type=discovery_prompt,
+        discovery_prompt_type="model_routing",
         learning_llm_model=config.llm_model,
         skill_id_model=config.skill_id_model,
         llm_base_url=openrouter_url,
         llm_api_key=openrouter_key,
         output_dir=str(Path(config.output_dir) / "learning"),
         experiment_name=config.experiment_name,
-        # Orchestration: use real eval script for routing accuracy
-        orchestration_eval_script=config.eval_script,
-        orchestration_model_config=config.model_config or "",
-        orchestration_orchestrator=config.orchestrator,
-        orchestration_max_rounds=config.max_rounds,
-        orchestration_concurrency=config.concurrency,
-        orchestration_tool_concurrency=config.tool_concurrency,
     )
 
     pipeline = LearningPipeline(llm=llm, config=lconfig, store=store)
@@ -741,50 +537,6 @@ def _evaluate_candidates_live_model_routing(
     return results
 
 
-def _evaluate_candidates_live_frames(
-    candidates: List[CandidateHandbook],
-    val_bundles: List[ExplorationBundle],
-    config: PipelineConfig,
-    work_dir: Path,
-) -> List[EvaluationResult]:
-    """Run real eval_frames.py on validation data for each candidate.
-
-    For each candidate: save handbook as stage_router JSON, run eval_frames,
-    parse accuracy + cost from per-query output files.
-    """
-    val_jsonl = work_dir / "validation_samples.jsonl"
-    with open(val_jsonl, "w") as f:
-        for i, b in enumerate(val_bundles):
-            gt = b.ground_truths[0] if b.ground_truths else ""
-            f.write(
-                json.dumps(
-                    {"id": b.query_id or f"val_{i}", "question": b.query, "answer": gt},
-                    ensure_ascii=False,
-                )
-                + "\n"
-            )
-    logger.info(f"Wrote {len(val_bundles)} validation samples to {val_jsonl}")
-
-    model_config_path = str(Path(config.model_config).resolve()) if config.model_config else ""
-    live_config = LiveEvalConfig(
-        eval_script=config.eval_script or "",
-        model_name=config.orchestrator,
-        model_type=config.orchestrator,
-        model_config=model_config_path,
-        routing_strategy=config.routing_strategy,
-        max_rounds=config.max_rounds,
-        concurrency=config.concurrency,
-        tool_concurrency=config.tool_concurrency,
-        dataset="frames",
-    )
-    evaluator = LiveEvaluator(
-        config=live_config,
-        val_queries_path=str(val_jsonl),
-        work_dir=str(work_dir / "live_runs"),
-    )
-    return evaluator.evaluate_all_candidates(candidates)
-
-
 def phase_select(
     config: PipelineConfig,
     handbook: SkillHandbook,
@@ -795,7 +547,6 @@ def phase_select(
 
     For model-routing: always runs real skill routing on validation data
     (actual LLM calls). Oracle is saved as reference only, not for selection.
-    For FRAMES: runs live eval_frames when eval_script is set, else oracle.
     """
     logger.info("=" * 60)
     logger.info("Phase 2: Handbook Selection")
@@ -861,77 +612,10 @@ def phase_select(
             [r.to_dict() for r in oracle_results], exp_name, "oracle_reference.json",
         )
         logger.debug(f"Oracle reference: {[f'{r.name}={r.accuracy:.1%}' for r in oracle_results]}")
-    elif (
-        config.task_type == "frames"
-        and len(val_bundles) >= 1
-        and config.eval_script
-        and Path(config.eval_script).exists()
-    ):
-        logger.info(
-            f"Running live FRAMES evaluation on {len(val_bundles)} validation samples "
-            "(real eval_frames.py, actual orchestrator runs)"
-        )
-        work_dir = Path(config.output_dir) / exp_name / "selection_live"
-        work_dir.mkdir(parents=True, exist_ok=True)
-        raw_runs_dir = work_dir / "live_runs"
-        logger.info(f"Raw results per candidate: {raw_runs_dir}/<candidate>/output/")
-        all_results = _evaluate_candidates_live_frames(
-            candidates, val_bundles, config, work_dir,
-        )
-        # Oracle is reference only - never used for selection
-        live_ok = any(
-            r.details.get("num_queries", 0) > 0 and not r.details.get("error")
-            for r in all_results
-        )
-        if not live_ok:
-            errors = [r.details.get("error", "")[:200] for r in all_results if r.details.get("error")]
-            raise RuntimeError(
-                "Live evaluation failed for all candidates. Selection requires successful live eval. "
-                "Check vLLM servers, network, and model_config. Sample error: "
-                + (errors[0] if errors else "no output")
-            )
-        best, all_results = select_pareto_optimal_live(
-            candidates, all_results, lambda_cost=config.lambda_cost,
-        )
-        # Save final consolidated summary (per-candidate summaries are in live_runs/<candidate>/summary.json)
-        # Selection: prioritize accuracy, cost = total_cost_all_models_all_tokens
-        live_summary = {
-            "description": "Final consolidated summary; per-candidate summaries in live_runs/<name>/summary.json",
-            "num_val_samples": len(val_bundles),
-            "selection_cost_metric": "total_cost_all_models_all_tokens",
-            "candidates": [
-                {
-                    "name": r.name,
-                    "accuracy": r.accuracy,
-                    "avg_cost_all_tokens": r.avg_cost,
-                    "total_cost_all_tokens": r.details.get("total_cost", 0.0),
-                    "total_cost_completion_only": r.details.get("total_cost_completion_only", 0.0),
-                    "num_correct": r.details.get("num_correct", 0),
-                    "num_queries": r.details.get("num_queries", 0),
-                    "elapsed_s": r.details.get("elapsed_s", 0.0),
-                    "costs_breakdown": r.details.get("costs_breakdown", {}),
-                    "selected": r.name == best.name,
-                }
-                for r in all_results
-            ],
-            "selected": best.name,
-        }
-        summary_path = work_dir / "live_selection_summary.json"
-        with open(summary_path, "w") as f:
-            json.dump(live_summary, f, indent=2)
-        logger.info(f"Saved live selection summary to {summary_path}")
-        oracle_results = [
-            evaluate_candidate_oracle(c, val_bundles, config.lambda_cost)
-            for c in candidates
-        ]
-        store.save_evaluation_results(
-            [r.to_dict() for r in oracle_results], exp_name, "oracle_reference.json",
-        )
     else:
-        # No live eval possible: require it for FRAMES selection
         raise RuntimeError(
-            "Selection requires live evaluation (val data + eval_script). "
-            "Oracle is reference only and is never used for selection."
+            "Selection requires validation data (val or train/val split). "
+            "Use --train-samples and --val-samples to provide data for selection."
         )
 
     store.save_evaluation_results(
@@ -1061,102 +745,16 @@ def phase_test_model_routing(
     return {"status": "completed", "output_dir": str(test_output)}
 
 
-def phase_test_frames(
-    config: PipelineConfig,
-    handbook: Union[SkillHandbook, str],
-    store: HandbookStore,
-) -> Dict[str, Any]:
-    """Test the selected handbook on FRAMES using eval_frames.py.
-
-    handbook: SkillHandbook to convert and use, or str path to StageSkillHandbook JSON
-    (e.g. from --handbook). When str, used directly for --handbook.
-    """
-    logger.info("=" * 60)
-    logger.info("Phase 3: Testing (FRAMES)")
-    logger.info("=" * 60)
-
-    if not config.eval_script or not Path(config.eval_script).exists():
-        raise RuntimeError(
-            "Test phase requires --eval-script pointing to eval_frames.py"
-        )
-
-    test_samples = config.test_samples or str(FRAMES_TEST_PATH)
-    logger.info(f"Test samples: {test_samples}")
-
-    if isinstance(handbook, str):
-        handbook_path = handbook
-    else:
-        handbook_path = Path(config.output_dir) / "test" / "stage_handbook.json"
-        handbook_path.parent.mkdir(parents=True, exist_ok=True)
-        save_as_stage_router(handbook, str(handbook_path))
-
-    strategies = [config.routing_strategy]
-    results = {}
-    repo_root = Path(__file__).resolve().parent.parent
-    eval_script_path = (repo_root / config.eval_script).resolve() if not Path(config.eval_script).is_absolute() else Path(config.eval_script).resolve()
-    eval_script_dir = str(eval_script_path.parent)
-
-    for strategy in strategies:
-        test_output = Path(config.output_dir) / "test" / f"frames_{strategy}"
-        test_output.mkdir(parents=True, exist_ok=True)
-
-        cmd = [
-            sys.executable, str(eval_script_path),
-            "--example_file_path", test_samples,
-            "--output_dir", str(test_output),
-            "--model_config", config.model_config,
-            "--model_type", config.orchestrator,
-            "--max_rounds", str(config.max_rounds),
-            "--concurrency", str(config.concurrency),
-            "--tool_concurrency", str(config.tool_concurrency),
-            "--routing_strategy", strategy,
-            "--handbook", str(handbook_path),
-        ]
-        if config.test_max_samples:
-            pass  # eval_frames uses all samples from example_file_path
-
-        logger.info(f"Running test ({strategy}): {' '.join(cmd)}")
-
-        env = os.environ.copy()
-        # Use so-internal orchestration/LLM_CALL (reusable, live runs output to output/)
-        repo_root = Path(__file__).resolve().parent.parent
-        orchestration_dir = repo_root / "orchestration"
-        env["REPO_PATH"] = str(orchestration_dir)
-        # Ensure eval_frames.py imports config from repo_root (not other configs in path)
-        existing_pythonpath = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = str(repo_root) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
-
-        result = subprocess.run(
-            cmd, cwd=eval_script_dir, env=env,
-            capture_output=False, text=True, timeout=14400,
-        )
-
-        if result.returncode != 0:
-            logger.error(f"Test {strategy} failed (see output above for details)")
-            results[strategy] = {"status": "failed", "stderr": "(see console output above)"}
-        else:
-            summary = _parse_frames_results(test_output)
-            results[strategy] = {"status": "success", "summary": summary}
-            logger.info(f"Test {strategy}: {json.dumps(summary, indent=2)[:500]}")
-
-    store.save_evaluation_results(
-        [results], config.experiment_name, "test_results.json",
-    )
-    return results
-
-
 # ===========================================================================
 # Handbook loading for test phase
 # ===========================================================================
 
 
 def _load_handbook_for_test(path: str) -> str:
-    """Resolve handbook path for test phase. Returns path to StageSkillHandbook JSON.
+    """Resolve handbook path for test phase. Returns path to handbook JSON.
 
     - If path is a directory: look for handbook.json or first .json file.
-    - If JSON has model_profiles: already StageSkillHandbook format, return path.
-    - If JSON has agent_profiles (SkillHandbook): load, convert via save_as_stage_router,
-      write to temp file, return temp path.
+    - If JSON has model_profiles or agent_profiles: return path as-is (RSL format).
     """
     p = Path(path).resolve()
     if p.is_dir():
@@ -1173,19 +771,11 @@ def _load_handbook_for_test(path: str) -> str:
     with open(p) as f:
         data = json.load(f)
 
-    if "model_profiles" in data:
+    if "model_profiles" in data or "agent_profiles" in data:
         return str(p)
 
-    if "agent_profiles" in data:
-        handbook = SkillHandbook.load(p)
-        fd, tmp_path = tempfile.mkstemp(suffix=".json", prefix="stage_handbook_")
-        os.close(fd)
-        save_as_stage_router(handbook, tmp_path)
-        return tmp_path
-
     raise ValueError(
-        f"Handbook at {p} has neither model_profiles (StageSkillHandbook) nor "
-        "agent_profiles (SkillHandbook)"
+        f"Handbook at {p} has neither model_profiles nor agent_profiles"
     )
 
 
@@ -1202,40 +792,26 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, Any]:
             raise FileNotFoundError(f"Run dir not found: {output_dir}")
         config.output_dir = str(output_dir)
         timestamp = output_dir.name
-        # Load config from run to get eval_script, model_config, etc.
+        # Load config from run to get model_config, routing_strategy, etc.
         cfg_path = output_dir / "pipeline_config.json"
         if cfg_path.exists():
             with open(cfg_path) as f:
                 saved = json.load(f)
             # Restore run settings; only restore dataset if user did NOT pass --dataset
-            for k in ("eval_script", "model_config", "orchestrator", "routing_strategy",
+            for k in ("model_config", "routing_strategy",
                       "max_rounds", "concurrency", "pool_models"):
                 if k in saved and saved[k] is not None:
                     setattr(config, k, saved[k])
-            
+
             if config.model_config and not Path(config.model_config).exists():
                 fallback = str(DEFAULT_MODEL_CONFIG)
                 if Path(fallback).exists():
                     logger.info(f"model_config {config.model_config} not found; using {fallback}")
                     config.model_config = fallback
 
-            if config.eval_script and not Path(config.eval_script).exists():
-                fallback = str(DEFAULT_EVAL_SCRIPT)
-                if Path(fallback).exists():
-                    logger.info(f"eval_script {config.eval_script} not found; using {fallback}")
-                    config.eval_script = fallback
-            # Restore dataset only if it's samples_100 (learning). Never use frames.jsonl for learn/select.
             if not config.dataset_from_cli and "dataset" in saved and saved["dataset"]:
-                saved_ds = saved["dataset"]
-                if "frames.jsonl" in saved_ds:
-                    config.dataset = str(FRAMES_SAMPLES_PATH)
-                    logger.info(
-                        f"Using samples_100 for learn/select (saved had frames.jsonl; "
-                        f"frames.jsonl is not used for learning)"
-                    )
-                else:
-                    config.dataset = saved_ds
-                    logger.info(f"Using dataset from run: {saved_ds} (experiment_name={config.experiment_name})")
+                config.dataset = saved["dataset"]
+                logger.info(f"Using dataset from run: {saved['dataset']} (experiment_name={config.experiment_name})")
             elif config.dataset:
                 logger.info(f"Using dataset: {config.dataset} (experiment_name={config.experiment_name})")
     else:
@@ -1246,40 +822,20 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, Any]:
         config.output_dir = str(output_dir)
 
     _repo_root = Path(__file__).resolve().parent.parent
-    # FRAMES: keep exploration + eval paths inside the repo / run dir (no stray relative-path failures)
-    if config.task_type == "frames":
-        if config.eval_script:
-            ep = Path(config.eval_script)
-            if not ep.is_absolute():
-                cand = (_repo_root / ep).resolve()
-                if cand.is_file():
-                    config.eval_script = str(cand)
-        if config.model_config:
-            mp = Path(config.model_config)
-            if not mp.is_absolute():
-                cand = (_repo_root / mp).resolve()
-                if cand.is_file():
-                    config.model_config = str(cand)
-        if config.test_samples:
-            tp = Path(config.test_samples)
-            if not tp.is_absolute():
-                cand = (_repo_root / tp).resolve()
-                if cand.is_file():
-                    config.test_samples = str(cand)
-        exp_samples = output_dir / "exploration" / "samples.jsonl"
-        if not config.samples_path and exp_samples.is_file():
-            config.samples_path = str(exp_samples.resolve())
-            logger.info(
-                "FRAMES: using samples_path under run dir (bundles match local exploration): %s",
-                config.samples_path,
-            )
+    # Resolve relative paths to absolute
+    if config.model_config:
+        mp = Path(config.model_config)
+        if not mp.is_absolute():
+            cand = (_repo_root / mp).resolve()
+            if cand.is_file():
+                config.model_config = str(cand)
 
     # If resuming (e.g. --phases test), copy learned/selected from latest run
     base_output_dir = output_dir.parent
     latest_link = base_output_dir / "latest"
     if not config.run_dir and latest_link.exists() and latest_link.resolve() != output_dir.resolve():
         prev = latest_link.resolve()
-        for subdir in ["model-routing_*", "frames_*"]:
+        for subdir in ["model-routing_*"]:
             import glob as _glob
             for src in _glob.glob(str(prev / subdir)):
                 dst = output_dir / Path(src).name
@@ -1311,30 +867,14 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, Any]:
         # -- Phase 0: Exploration --
         exploration_path: Optional[Path] = None
         if "explore" in config.phases:
-            if config.task_type == "model-routing":
-                exploration_path = phase_explore_model_routing(config)
-            else:
-                exploration_path = phase_explore_frames(config)
+            exploration_path = phase_explore_model_routing(config)
             results["exploration_path"] = str(exploration_path)
         elif config.exploration_data:
             exploration_path = Path(config.exploration_data)
         else:
-            if config.task_type == "model-routing":
-                existing = find_rsl_results(RSL_RESULTS_DIR, config.dataset)
-                if existing:
-                    exploration_path = existing
-            elif config.task_type == "frames":
-                local_explore = Path(config.output_dir) / "exploration"
-                if local_explore.is_dir():
-                    exploration_path = local_explore
-                    logger.info(
-                        "Using exploration under output dir (results stay in this run): %s",
-                        exploration_path,
-                    )
-                elif FRAMES_EXPLORATION_DIR.exists():
-                    exploration_path = FRAMES_EXPLORATION_DIR
-            elif FRAMES_EXPLORATION_DIR.exists():
-                exploration_path = FRAMES_EXPLORATION_DIR
+            existing = find_rsl_results(RSL_RESULTS_DIR, config.dataset)
+            if existing:
+                exploration_path = existing
 
         bundles = _load_bundles(config, exploration_path)
         if not bundles:
@@ -1390,7 +930,6 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, Any]:
     # Skip loading when only testing with --handbook (use passed handbook instead)
     test_only_with_handbook = (
         "test" in config.phases
-        and config.task_type == "frames"
         and config.handbook_path
         and "learn" not in config.phases
         and "select" not in config.phases
@@ -1420,8 +959,7 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, Any]:
                 if "learn" not in config.phases:
                     raise RuntimeError(
                         f"No learned handbook found for experiment '{config.experiment_name}'. "
-                        "Run with --phases learn (or learn,select) to create one. "
-                        "Learning/validation use samples_100.jsonl; testing uses frames_test.jsonl."
+                        "Run with --phases learn (or learn,select) to create one."
                     )
                 if needs_bundles:
                     logger.warning("No learned handbook found. Running manual learning.")
@@ -1449,19 +987,11 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, Any]:
 
     # -- Phase 3: Testing --
     if "test" in config.phases:
-        if config.task_type == "model-routing":
-            test_handbook = selected.handbook
-        else:
-            # FRAMES: allow --handbook to override (test a specific handbook file or dir)
-            if config.handbook_path:
-                test_handbook = _load_handbook_for_test(config.handbook_path)
-                logger.info(f"Using handbook from --handbook: {config.handbook_path}")
-            else:
-                test_handbook = selected.handbook
-        if config.task_type == "model-routing":
-            test_results = phase_test_model_routing(config, test_handbook, store)
-        else:
-            test_results = phase_test_frames(config, test_handbook, store)
+        test_handbook = selected.handbook
+        if config.handbook_path:
+            test_handbook = _load_handbook_for_test(config.handbook_path)
+            logger.info(f"Using handbook from --handbook: {config.handbook_path}")
+        test_results = phase_test_model_routing(config, test_handbook, store)
         results["test"] = test_results
 
     results["completed_at"] = datetime.now().isoformat()
@@ -1610,30 +1140,15 @@ def _load_bundles(
 
     exploration_path = Path(exploration_path)
 
-    if config.task_type == "model-routing":
-        if exploration_path.is_file() and exploration_path.suffix == ".jsonl":
-            bundles = load_rsl_results(exploration_path, config.max_train_samples)
-            stats = rsl_stats(bundles)
-            logger.info(f"RSL stats: {json.dumps(stats, indent=2)}")
-            return bundles
-        existing = find_rsl_results(exploration_path, config.dataset)
-        if existing:
-            return load_rsl_results(existing, config.max_train_samples)
-        return []
-
-    else:  # frames
-        samples_path = config.samples_path
-        if not samples_path and FRAMES_SAMPLES_PATH.exists():
-            samples_path = str(FRAMES_SAMPLES_PATH)
-
-        if samples_path and exploration_path.is_dir():
-            bundles = load_exploration_dataset(str(exploration_path), samples_path)
-            stats = exploration_stats(bundles)
-            logger.info(f"Exploration stats: {json.dumps(stats, indent=2)[:500]}")
-            if config.max_train_samples:
-                bundles = bundles[: config.max_train_samples]
-            return bundles
-        return []
+    if exploration_path.is_file() and exploration_path.suffix == ".jsonl":
+        bundles = load_rsl_results(exploration_path, config.max_train_samples)
+        stats = rsl_stats(bundles)
+        logger.info(f"RSL stats: {json.dumps(stats, indent=2)}")
+        return bundles
+    existing = find_rsl_results(exploration_path, config.dataset)
+    if existing:
+        return load_rsl_results(existing, config.max_train_samples)
+    return []
 
 
 def _find_latest_file(directory: Path, filename: str) -> Optional[Path]:
@@ -1652,38 +1167,6 @@ def _find_and_load_json(directory: Path, filename: str) -> Optional[Dict]:
         with open(path) as f:
             return json.load(f)
     return None
-
-
-def _parse_frames_results(output_dir: Path) -> Dict[str, Any]:
-    """Parse FRAMES evaluation results from output directory."""
-    results = {"output_dir": str(output_dir)}
-
-    result_files = list(output_dir.rglob("*.json"))
-    correct = 0
-    total = 0
-    total_cost = 0.0
-
-    for f in result_files:
-        if f.name.startswith("step_") or f.name == "pipeline_config.json":
-            continue
-        try:
-            with open(f) as fh:
-                data = json.load(fh)
-            if isinstance(data, dict) and "correct" in data:
-                total += 1
-                if data.get("correct"):
-                    correct += 1
-                total_cost += data.get("total_cost", 0.0)
-        except (json.JSONDecodeError, KeyError):
-            continue
-
-    if total > 0:
-        results["accuracy"] = correct / total
-        results["correct"] = correct
-        results["total"] = total
-        results["avg_cost"] = total_cost / total
-
-    return results
 
 
 def _save_config(config: PipelineConfig, path: Path) -> None:
@@ -1727,43 +1210,6 @@ def build_parser() -> argparse.ArgumentParser:
                               "weakest_skill", "strongest_skill"],
                      help="Routing strategy (default: weighted_avg, matches test_skill_routing)")
 
-    # -- FRAMES --
-    fr = subparsers.add_parser(
-        "frames",
-        help="FRAMES agent orchestration pipeline",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    _add_common_args(fr)
-    fr.add_argument("--dataset", type=str, default=str(FRAMES_SAMPLES_PATH),
-                     help="Samples for explore/learn/select (default: frames_train.jsonl). Do NOT use frames.jsonl here for exploration since this is full dataset.")
-    fr.add_argument("--samples-path", type=str, default=None,
-                     help="Path to samples JSONL (for loading exploration data)")
-    fr.add_argument("--test-samples", type=str, default=None,
-                     help="Samples for test phase (default: data/frames_test.jsonl)")
-    fr.add_argument("--orchestrator", type=str, default="Qwen/Qwen3-8B",
-                     help="Orchestrator model")
-    fr.add_argument("--model-config", type=str, default=str(DEFAULT_MODEL_CONFIG),
-                     help="Model config JSON (default: config/eval_config.json)")
-    fr.add_argument("--eval-script", type=str, default=None,
-                     help="Path to eval_frames.py (required for explore/test phases)")
-    fr.add_argument("--routing-strategy", type=str, default="weighted_avg",
-                     choices=["router_decides", "weighted_avg", "analyze_model_decide",
-                              "weakest_skill", "strongest_skill"],
-                     help="Routing strategy for testing")
-    fr.add_argument("--max-rounds", type=int, default=15,
-                     help="Max turns per problem (default: 15)")
-    fr.add_argument("--concurrency", type=int, default=10,
-                     help="Concurrent samples to process (default: 10)")
-    fr.add_argument("--tool-concurrency", type=int, default=5,
-                     help="Concurrent tool calls per sample (default: 5)")
-    fr.add_argument("--exploration-stages", type=str, default=None,
-                     help="Comma-separated stages to explore (search,code,answer). Default: all.")
-    fr.add_argument("--exploration-models", type=str, default=None,
-                     help="Comma-separated model IDs to explore (e.g. answer-math-1). Default: all.")
-    fr.add_argument("--handbook", type=str, default=None,
-                     help="Path to handbook JSON or directory (handbook.json) for test phase. "
-                          "Overrides selected handbook. Supports SkillHandbook and StageSkillHandbook formats.")
-
     return parser
 
 
@@ -1778,7 +1224,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-train-samples", type=int, default=None,
                          help="Max training samples to use")
     parser.add_argument("--exploration-samples", type=int, default=None,
-                         help="Max samples for exploration phase (frames default: 30)")
+                         help="Max samples for exploration phase")
     parser.add_argument("--exploration-epochs", type=int, default=1,
                          help="Epochs for exploration")
 
@@ -1815,7 +1261,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--test-max-samples", type=int, default=None,
                          help="Max samples for test phase")
     parser.add_argument("--run-dir", type=str, default=None,
-                         help="Use existing run dir (e.g. output/frames/20260316_061846) instead of creating new")
+                         help="Use existing run dir (e.g. output/nq/20260316_061846) instead of creating new")
     parser.add_argument("--use-existing-candidates", action="store_true",
                          help="Load candidates handbooks from store instead of regenerating (for selection-only runs)")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -1828,7 +1274,7 @@ def main():
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Default output: output/<dataset_name> (e.g. output/nq_validation_qwen, output/frames)
+    # Default output: output/<dataset_name> (e.g. output/nq_validation_qwen)
     ds = args.dataset or ""
     if "/" in ds:
         ds = Path(ds).stem
@@ -1869,33 +1315,12 @@ def main():
         test_max_samples=args.test_max_samples,
     )
 
-    if args.task_type == "model-routing":
-        config.test_dataset = args.test_dataset
-        config.router_model = args.router_model
-        config.distributed_config = args.distributed_config
-        config.routing_strategy = args.routing_strategy
-        if args.pool_models:
-            config.pool_models = args.pool_models.split(",")
-    else:
-        config.samples_path = args.samples_path
-        config.test_samples = args.test_samples
-        config.orchestrator = args.orchestrator
-        config.model_config = args.model_config
-        config.pool_models = list(DEFAULT_FRAMES_POOL_MODELS)  # FRAMES routing pool (search/code/answer models)
-        config.eval_script = getattr(args, "eval_script", None)
-        if getattr(args, "exploration_stages", None):
-            config.exploration_stages = [s.strip() for s in args.exploration_stages.split(",")]
-        if getattr(args, "exploration_models", None):
-            config.exploration_models = [m.strip() for m in args.exploration_models.split(",")]
-        if not config.eval_script:
-            default_eval = Path(__file__).resolve().parent.parent / "orchestration" / "eval_frames.py"
-            if default_eval.exists():
-                config.eval_script = str(default_eval)
-        config.routing_strategy = args.routing_strategy
-        config.max_rounds = args.max_rounds
-        config.concurrency = args.concurrency
-        config.tool_concurrency = getattr(args, "tool_concurrency", 10)
-        config.handbook_path = getattr(args, "handbook", None)
+    config.test_dataset = args.test_dataset
+    config.router_model = args.router_model
+    config.distributed_config = args.distributed_config
+    config.routing_strategy = args.routing_strategy
+    if args.pool_models:
+        config.pool_models = args.pool_models.split(",")
 
     # Default: first 30 samples for exploration when running explore phase
     if "explore" in config.phases and config.exploration_samples is None:

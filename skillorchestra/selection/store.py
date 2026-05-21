@@ -7,11 +7,10 @@ Directory layout:
         learned/
           handbook_full.json          # H* from learning pipeline
         candidates/
-          search2_code1_answer0.json  # per-mode depth candidates
-          search1_code0_answer0.json
+          mode_depth_candidates.json  # per-mode depth candidates
           ...
         selected/
-          <orchestrator_name>.json    # best handbook per orchestrator
+          <name>.json                 # best handbook per selection run
         evaluation/
           results.json                # evaluation results for all candidates
           live_results.json           # live evaluation results
@@ -158,38 +157,38 @@ class HandbookStore:
         )
 
     # ------------------------------------------------------------------
-    # Selected handbooks (per-orchestrator)
+    # Selected handbooks
     # ------------------------------------------------------------------
 
     def save_selected(
         self,
         handbook: SkillHandbook,
-        orchestrator_name: str,
+        name: str,
         experiment_name: str,
         eval_result: Optional[Dict[str, Any]] = None,
     ) -> Path:
-        """Save the selected handbook for a specific orchestrator."""
+        """Save the selected handbook."""
         exp_dir = self.create_experiment(experiment_name)
-        path = exp_dir / "selected" / f"{orchestrator_name}.json"
+        path = exp_dir / "selected" / f"{name}.json"
         handbook.save(path)
 
         if eval_result:
-            meta_path = exp_dir / "selected" / f"{orchestrator_name}.meta.json"
+            meta_path = exp_dir / "selected" / f"{name}.meta.json"
             with open(meta_path, "w") as f:
                 json.dump(eval_result, f, indent=2)
 
-        logger.info(f"Saved selected handbook for orchestrator={orchestrator_name}")
+        logger.info(f"Saved selected handbook: {name}")
         return path
 
     def load_selected(
-        self, orchestrator_name: str, experiment_name: str
+        self, name: str, experiment_name: str
     ) -> SkillHandbook:
-        """Load the selected handbook for an orchestrator."""
-        path = self.experiment_dir(experiment_name) / "selected" / f"{orchestrator_name}.json"
+        """Load the selected handbook."""
+        path = self.experiment_dir(experiment_name) / "selected" / f"{name}.json"
         return SkillHandbook.load(path)
 
     def list_selected(self, experiment_name: str) -> List[str]:
-        """List orchestrator names that have a selected handbook."""
+        """List names that have a selected handbook."""
         sel_dir = self.experiment_dir(experiment_name) / "selected"
         if not sel_dir.exists():
             return []
@@ -281,6 +280,6 @@ class HandbookStore:
             "learned_handbook": learned_exists,
             "num_candidates": len(candidates),
             "candidates": candidates,
-            "selected_orchestrators": selected,
+            "selected": selected,
             "snapshots": snapshots,
         }

@@ -8,7 +8,6 @@
 #   ./scripts/setup/run.sh --env        # Pipeline + SGLang only
 #   ./scripts/setup/run.sh --sglang     # SGLang only
 #   ./scripts/setup/run.sh --retriever  # Retriever only
-#   ./scripts/setup/run.sh --orchestration [--setup-envs]  # Agent orchestration
 #
 # =============================================================================
 
@@ -25,10 +24,6 @@ case "${1:---all}" in
         ;;
     --retriever)
         "$SCRIPT_DIR/retriever.sh"
-        ;;
-    --orchestration)
-        shift
-        "$SCRIPT_DIR/agent_orchestration.sh" "$@"
         ;;
     --all|*)
         echo "Setting up all environments..."

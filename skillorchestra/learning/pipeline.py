@@ -15,10 +15,7 @@ import copy
 import json
 import logging
 import os
-import shutil
-import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -68,13 +65,11 @@ class LearningConfig:
     # Skill discovery
     max_discovery_bundles: Optional[int] = None
     max_pairs_per_prompt: int = 5
-    discovery_prompt_type: str = "model_routing"  # "model_routing" or "agent_orchestration"
-
     # Profiling
     use_llm_for_skill_id: bool = True
     skill_id_traces_path: Optional[str] = None  # If set, save raw traces for skill identification (JSONL)
 
-    # LLM for learning-critical operations (unified for model routing + agent orchestration)
+    # LLM for learning-critical operations
     learning_llm_model: str = "gpt-5"  # Discovery, refinement, insight, summarization
     skill_id_model: Optional[str] = None  # Skill identification. If None, use learning_llm_model.
     llm_base_url: str = ""  # Explicit base_url for LLM client (overrides env)
@@ -94,14 +89,6 @@ class LearningConfig:
     lambda_c: float = 0.1
     temperature: float = 0.6
     seed: Optional[int] = 42
-
-    # Orchestration: real eval for agent orchestration, e.g., orchestration/eval_frames.py (when set, overrides use_full_router_eval)
-    orchestration_eval_script: Optional[str] = None
-    orchestration_model_config: str = ""
-    orchestration_orchestrator: str = "Qwen/Qwen3-8B"
-    orchestration_max_rounds: int = 20
-    orchestration_concurrency: int = 10
-    orchestration_tool_concurrency: int = 5
 
     # Output
     output_dir: Optional[str] = None
@@ -177,7 +164,6 @@ class LearningPipeline:
             merge_perf_threshold=self.config.merge_perf_threshold,
             min_observations_for_split=self.config.min_observations_for_split,
             versioner=versioner,
-            prompt_type=self.config.discovery_prompt_type,
             max_merge_credits=self.config.max_merge_credits,
             max_split_credits=self.config.max_split_credits,
         )
@@ -231,7 +217,6 @@ class LearningPipeline:
         new_skills = self.discoverer.discover_from_bundles(
             discovery_bundles,
             handbook,
-            prompt_type=self.config.discovery_prompt_type,
         )
         stats["skills_discovered"] = len(new_skills)
         self._snapshot(handbook, "discovery", oracle_accuracy=val_oracle)
@@ -429,122 +414,6 @@ class LearningPipeline:
 
         return correct / total if total > 0 else 0.0
 
-    def _evaluate_orchestration_routing(
-        self,
-        bundles: List[ExplorationBundle],
-        handbook: SkillHandbook,
-    ) -> float:
-        """Evaluate handbook routing by running real orchestration eval script."""
-        if not bundles:
-            return 0.0
-
-        logger.info(
-            f"Evaluating routing via orchestration eval script on {len(bundles)} validation bundles "
-            f"(script={self.config.orchestration_eval_script})"
-        )
-
-        from ..converters.to_stage_router import save_as_stage_router
-
-        repo_root = Path(__file__).resolve().parent.parent.parent
-        # Use learning output dir when available; otherwise temp (ephemeral)
-        if self.config.output_dir:
-            eval_work_dir = (Path(self.config.output_dir) / "routing_eval").resolve()
-            eval_work_dir.mkdir(parents=True, exist_ok=True)
-            tmp = eval_work_dir
-            logger.info(f"Routing eval artifacts: {tmp} (handbook.json, val_samples.jsonl, output/)")
-        else:
-            tmp = Path(tempfile.mkdtemp(prefix="so_routing_eval_"))
-
-        try:
-            handbook_path = tmp / "handbook.json"
-            save_as_stage_router(handbook, handbook_path)
-
-            val_jsonl = tmp / "val_samples.jsonl"
-            with open(val_jsonl, "w") as f:
-                for i, b in enumerate(bundles):
-                    f.write(
-                        json.dumps(
-                            {
-                                "id": b.query_id or f"val_{i}",
-                                "question": b.query,
-                                "answer": b.ground_truths[0] if b.ground_truths else "",
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
-
-            output_dir = tmp / "output"
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-            cmd = [
-                sys.executable,
-                self.config.orchestration_eval_script,
-                "--model_name",
-                self.config.orchestration_orchestrator,
-                "--model_type",
-                self.config.orchestration_orchestrator,
-                "--output_dir",
-                str(output_dir),
-                "--example_file_path",
-                str(val_jsonl),
-                "--max_rounds",
-                str(self.config.orchestration_max_rounds),
-                "--routing_strategy",
-                "weighted_avg",
-                "--handbook",
-                str(handbook_path),
-                "--concurrency",
-                str(self.config.orchestration_concurrency),
-                "--tool_concurrency",
-                str(self.config.orchestration_tool_concurrency),
-                "--no_progress",
-            ]
-            if self.config.orchestration_model_config:
-                cmd.extend(["--model_config", self.config.orchestration_model_config])
-
-            env = os.environ.copy()
-            env["REPO_PATH"] = str(repo_root / "orchestration")
-            existing_pythonpath = env.get("PYTHONPATH", "")
-            env["PYTHONPATH"] = str(repo_root) + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
-
-            try:
-                result = subprocess.run(
-                    cmd,
-                    cwd=str(Path(self.config.orchestration_eval_script).parent),
-                    env=env,
-                    capture_output=True,
-                    text=True,
-                    timeout=3600,
-                )
-            except subprocess.TimeoutExpired:
-                logger.warning("eval_frames.py timed out for routing accuracy")
-                return 0.0
-
-            if result.returncode != 0:
-                logger.warning(
-                    f"eval_frames.py failed for routing accuracy: rc={result.returncode}\n"
-                    f"{result.stderr[-500:] if result.stderr else ''}"
-                )
-                return 0.0
-
-            num_correct = 0
-            for jf in sorted(output_dir.rglob("*.json")):
-                if jf.name.startswith("step_") or jf.name == "pipeline_config.json":
-                    continue
-                try:
-                    with open(jf) as fh:
-                        data = json.load(fh)
-                    if data.get("correct"):
-                        num_correct += 1
-                except Exception:
-                    pass
-
-            return num_correct / len(bundles) if bundles else 0.0
-        finally:
-            if not self.config.output_dir and tmp.exists():
-                shutil.rmtree(tmp, ignore_errors=True)
-
     def _evaluate_full_router_routing(
         self,
         bundles: List[ExplorationBundle],
@@ -606,13 +475,7 @@ class LearningPipeline:
         bundles: List[ExplorationBundle],
         handbook: SkillHandbook,
     ) -> float:
-        """Evaluate handbook routing.
-
-        For orchestration: run real eval when orchestration_eval_script is set.
-        For model routing: full LLM router (test_skill_routing) or oracle fallback.
-        """
-        if self.config.orchestration_eval_script and Path(self.config.orchestration_eval_script).exists():
-            return self._evaluate_orchestration_routing(bundles, handbook)
+        """Evaluate handbook routing: full LLM router or oracle fallback."""
         if self.config.use_full_router_eval:
             return self._evaluate_full_router_routing(bundles, handbook)
         return self._evaluate_oracle_routing(bundles, handbook)

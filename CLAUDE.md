@@ -4,24 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-SkillOrchestra is a framework for skill-aware orchestration of compound AI systems. Instead of learning routing policies end-to-end, it learns fine-grained **skills** from execution experience and models agent-specific competence and cost under those skills. At deployment, the orchestrator infers skill demands of each interaction and selects agents that best satisfy them under a performance-cost trade-off.
-
-Two task types are supported:
-- **Model routing** — Route queries to the best pool model (QA benchmarks like NQ, TriviaQA, Math)
-- **Agent orchestration (FRAMES)** — Multi-stage agent orchestration with search/code/answer stages
+SkillOrchestra is a framework for skill-aware model routing. Instead of learning routing policies end-to-end, it learns fine-grained **skills** from execution experience and models model-specific competence and cost under those skills. At deployment, the router infers skill demands of each query and selects the best pool model under a performance-cost trade-off.
 
 ## Environment & Setup
 
-Three conda environments are used:
+Two conda environments are used:
 
 ```bash
 ./scripts/setup/run.sh                        # Install all environments
 ./scripts/setup/env.sh --pipeline              # so_env: pipeline + exploration + learning
 ./scripts/setup/env.sh --sglang                # sglang_env: model serving via SGLang
-./scripts/setup/retriever.sh                   # retriever: Qwen3-Embedding + FAISS
 ```
 
-Copy `.env.example` to `.env` and set `OPENAI_API_KEY` (or `OPENAI_GATEWAY_KEY`), `INDEX_DIR` (for retrieval), and optionally `HF_HOME`.
+Copy `.env.example` to `.env` and set `OPENAI_API_KEY` (or `OPENAI_GATEWAY_KEY`), and optionally `HF_HOME`.
 
 ## Serving Models
 
@@ -30,10 +25,7 @@ Models must be running before exploration/selection/testing:
 ```bash
 conda activate sglang_env
 ./scripts/serve/serve_routing.sh        # Model routing pool
-./scripts/serve/serve_orchestration.sh  # Agent orchestration + retriever
 ```
-
-Edit `config/eval_config.json` to match model host/ports if not using localhost.
 
 ## Running the Pipeline
 
@@ -63,16 +55,6 @@ python scripts/pipeline.py model-routing \
 
 # No-LLM mode (manual skills for testing)
 python scripts/pipeline.py model-routing ... --no-llm
-```
-
-### Agent Orchestration (FRAMES)
-
-```bash
-python scripts/pipeline.py frames \
-    --output-dir output/frames \
-    --eval-script orchestration/eval_frames.py \
-    --test-samples data/frames_test.jsonl \
-    --phases explore,learn,select,test
 ```
 
 ### Key flags
@@ -105,49 +87,61 @@ explore → learn → select → test
 
 - **`core/`** — Central data model: `Skill`, `AgentProfile`, `BetaCompetence` (Bayesian competence estimation), `CostStats`, `SkillHandbook` (the full learned artifact with skills, agent profiles, mode metadata, routing logic), and `ExecutionTrace`/`ExplorationBundle` (trace data model)
 - **`learning/`** — Learning pipeline orchestration (`pipeline.py`), skill discovery via LLM taxonomy (`discoverer.py`), agent profiling (`profiler.py`), and refinement with split/merge operations (`refiner.py`, `failure_refiner.py`)
-- **`selection/`** — Candidate handbook generation at varying skill granularity (`candidates.py`), Pareto-optimal selection from evaluation results (`pareto.py`), live evaluation by running real routing (`live_eval.py`), and versioned storage (`store.py`)
-- **`routing/`** — Deployment-time orchestrator (`orchestrator.py`), SGLang pool model service client (`pool_service.py`), and API provider abstraction (`api_provider.py`)
-- **`converters/`** — Format conversion between SkillHandbook and downstream formats (RSL for model routing, StageRouter for agent orchestration)
+- **`selection/`** — Candidate handbook generation at varying skill granularity (`candidates.py`), Pareto-optimal selection from evaluation results (`pareto.py`), and versioned storage (`store.py`)
+- **`routing/`** — Deployment-time router (`pool_service.py`), and API provider abstraction (`api_provider.py`)
+- **`converters/`** — Format conversion between SkillHandbook and downstream formats (RSL for model routing)
 - **`llm/`** — LLM client with multi-provider support (OpenAI, Salesforce gateway, custom OpenAI-compatible), structured output parsing, retry logic
 - **`prompts/`** — Prompt templates for skill discovery, model routing analysis, and evaluation
 - **`eval/`** — Exact match and F1 scoring utilities
-- **`adapters/`** — Adapters for external router formats
 
 ### Key Data Flow
 
 ```
-ExecutionTrace (per-query, per-agent) 
-    → ExplorationBundle (all agents for one query)
+ExecutionTrace (per-query, per-model)
+    → ExplorationBundle (all models for one query)
         → SkillHandbook (skills + agent profiles + mode metadata)
             → CandidateHandbook (subgraphs at different granularity)
-                → Selected handbook → RSL/StageRouter JSON → test
+                → Selected handbook → RSL JSON → test
 ```
 
 ### Data Types (from `core/types.py`)
 
 - **`Skill`** — A reusable capability with skill_id, description, indicators (keywords for matching), examples, and provenance tracking
-- **`BetaCompetence`** — Bayesian Beta(α,β) distribution for agent competence on a skill; `alpha-1` = successes, `beta-1` = failures
-- **`AgentProfile`** — Per-agent record with skill_competence map, cost stats, strengths/weaknesses
-- **`SkillHandbook`** — The central artifact: mode registry, skill registry, agent profiles, mode-skill index. Provides `select_agent()` with hierarchical tie-breaking (skill → category → mode → cost)
+- **`BetaCompetence`** — Bayesian Beta(alpha,beta) distribution for model competence on a skill; `alpha-1` = successes, `beta-1` = failures
+- **`AgentProfile`** — Per-model record with skill_competence map, cost stats, strengths/weaknesses
+- **`SkillHandbook`** — The central artifact: mode registry, skill registry, agent profiles, mode-skill index. Provides `select_agent()` with hierarchical tie-breaking (skill -> category -> mode -> cost)
 
 ### Configuration Files
 
 - **`config/pool_config.json`** — Model pool: model paths, ports, pricing, host env vars. Edit to add/remove models.
-- **`config/eval_config.json`** — Model endpoint IP:port mapping for orchestration (vLLM/SGLang servers)
-- **`config/models.py`** — Agent ID → model name resolution
-- **`config/pipeline.py`** — Default paths, model lists, pool configurations
-- **`.env`** — API keys, cache paths, index directory (from `.env.example`)
+- **`config/api_models.json`** — API model registry: providers (base URL, endpoint), models (identifier, provider, model name), and pricing. Edit to add API-based models.
+- **`config/pipeline.py`** — Default paths, model lists, pool configurations.
+- **`.env`** — API keys, cache paths (from `.env.example`).
 
 ### Model Routing-specific (`model_routing/`)
 
 - `explore.py` — Run all pool models on a dataset, collect answers + correctness
-- `test_skill_routing.py` — Skill-based routing inference: LLM router identifies active skills → weighted competence scoring → agent selection → pool model call → EM evaluation
+- `test_skill_routing.py` — Skill-based routing inference: LLM router identifies active skills -> weighted competence scoring -> agent selection -> pool model call -> EM evaluation
 - `load_qa_dataset.py` — Dataset loading from HuggingFace
 
-### FRAMES-specific
+## Model Calling Logic
 
-- `orchestration/eval_frames.py` — Multi-stage agent evaluation (search → code → answer) with configurable models per stage and skill-based routing via `--handbook`
-- `orchestration/LLM_CALL.py` — Shared LLM call utilities for orchestration
+The router uses **API first, then SGLang fallback**:
+
+```
+test_skill_routing.py (per question)
+  |- call_router()
+  |    |- 1st: local SGLang (health check -> /generate)
+  |    |- fallback: API (config/api_models.json)
+  |
+  |- parse_skill_analysis() -> route_by_weighted_avg()
+  |
+  |- call_pool_model_unified()
+       |- 1st: API (APIPoolProvider -> config/api_models.json)
+       |- fallback: local SGLang (config/pool_config.json)
+```
+
+To add a new API model, edit `config/api_models.json` (`providers` + `models` + `pricing`) and set the API key in `.env`. No Python code changes needed.
 
 ## Learning Pipeline Details
 

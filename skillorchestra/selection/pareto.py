@@ -1,14 +1,13 @@
-"""
-Pareto-optimal handbook selection.
+"""Pareto-optimal handbook selection.
 
-For a target orchestrator O, evaluate candidate handbooks on a validation
-set and select the one on the Pareto frontier of (accuracy, cost).
+Evaluate candidate handbooks on a validation set and select the one
+on the Pareto frontier of (accuracy, cost).
 
 Supports two evaluation modes:
 1. Oracle (offline): check if handbook routing would pick a successful agent
    from the exploration traces. Fast and free.
-2. Live: run the real orchestrator with eval scripts and measure accuracy
-   + cost. Expensive but realistic.
+2. Live: run real routing inference and measure accuracy + cost.
+   Expensive but realistic.
 """
 
 from __future__ import annotations
@@ -164,7 +163,7 @@ def select_pareto_optimal(
 
 
 # ---------------------------------------------------------------------------
-# Live evaluation (real orchestrator runs)
+# Live evaluation (real routing runs)
 # ---------------------------------------------------------------------------
 
 def select_pareto_optimal_live(

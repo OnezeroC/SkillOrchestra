@@ -22,8 +22,6 @@ from ..core.handbook import SkillHandbook
 from ..core.types import BetaCompetence, Skill, SkillProvenance
 from ..llm.client import LLMClient
 from skillorchestra.prompts.learning import (
-    AGENT_ORCHESTRATION_MERGE_PROMPT,
-    AGENT_ORCHESTRATION_SPLIT_PROMPT,
     SKILL_MERGE_PROMPT,
     SKILL_SPLIT_PROMPT,
 )
@@ -115,7 +113,6 @@ class HandbookRefiner:
         merge_perf_threshold: float = 0.0,
         min_observations_for_split: int = 3,
         versioner: Optional[HandbookVersioner] = None,
-        prompt_type: str = "model_routing",
         max_merge_credits: int = 50,
         max_split_credits: int = 1,
     ):
@@ -124,7 +121,6 @@ class HandbookRefiner:
         self.merge_perf_threshold = merge_perf_threshold
         self.min_observations_for_split = min_observations_for_split
         self.versioner = versioner
-        self.prompt_type = prompt_type
         self.max_merge_credits = max_merge_credits
         self.max_split_credits = max_split_credits
 
@@ -314,34 +310,15 @@ class HandbookRefiner:
 
         perf_evidence = self._format_merge_evidence(handbook, candidate)
 
-        if self.prompt_type == "agent_orchestration":
-            skills_definitions = f"""### Skill 1: {s1.skill_id}
-Name: {s1.name}
-Description: {s1.description}
-Examples: {', '.join(s1.examples[:3])}
-
-### Skill 2: {s2.skill_id}
-Name: {s2.name}
-Description: {s2.description}
-Examples: {', '.join(s2.examples[:3])}"""
-            skill1_queries = "\n".join(f"- {q[:150]}" for q in s1.examples[:5]) or "(no samples)"
-            skill2_queries = "\n".join(f"- {q[:150]}" for q in s2.examples[:5]) or "(no samples)"
-            prompt = AGENT_ORCHESTRATION_MERGE_PROMPT.format(
-                skills_definitions=skills_definitions,
-                performance_correlation=perf_evidence,
-                skill1_queries=skill1_queries,
-                skill2_queries=skill2_queries,
-            )
-        else:
-            prompt = SKILL_MERGE_PROMPT.format(
-                skill_1_id=s1.skill_id,
-                skill_1_name=s1.name,
-                skill_1_description=s1.description,
-                skill_2_id=s2.skill_id,
-                skill_2_name=s2.name,
-                skill_2_description=s2.description,
-                performance_evidence=perf_evidence,
-            )
+        prompt = SKILL_MERGE_PROMPT.format(
+            skill_1_id=s1.skill_id,
+            skill_1_name=s1.name,
+            skill_1_description=s1.description,
+            skill_2_id=s2.skill_id,
+            skill_2_name=s2.name,
+            skill_2_description=s2.description,
+            performance_evidence=perf_evidence,
+        )
 
         self.llm.set_role("skill_refiner")
         try:
@@ -404,34 +381,14 @@ Examples: {', '.join(s2.examples[:3])}"""
 
         perf_evidence = self._format_split_evidence(handbook, candidate)
 
-        if self.prompt_type == "agent_orchestration":
-            skill_definition = f"""ID: {skill.skill_id}
-Name: {skill.name}
-Description: {skill.description}
-Examples: {'; '.join(skill.examples[:3])}"""
-            performance_data = perf_evidence
-            all_queries = skill.examples
-            high_perf = "\n".join(f"- {q[:150]}" for q in all_queries[:5]) or "(none)"
-            low_perf = "\n".join(f"- {q[:150]}" for q in all_queries[5:10]) or "(none)"
-            divergent = "\n".join(f"- {q[:150]}" for q in all_queries[10:15]) or "(none)"
-            prompt = AGENT_ORCHESTRATION_SPLIT_PROMPT.format(
-                skill_definition=skill_definition,
-                performance_data=performance_data,
-                high_perf_queries=high_perf,
-                low_perf_queries=low_perf,
-                divergent_queries=divergent,
-                success_trajectories="(not provided)",
-                failure_trajectories="(not provided)",
-            )
-        else:
-            prompt = SKILL_SPLIT_PROMPT.format(
-                skill_id=skill.skill_id,
-                skill_name=skill.name,
-                skill_description=skill.description,
-                mode=skill.mode,
-                performance_evidence=perf_evidence,
-                sample_queries="\n".join(skill.examples[:5]),
-            )
+        prompt = SKILL_SPLIT_PROMPT.format(
+            skill_id=skill.skill_id,
+            skill_name=skill.name,
+            skill_description=skill.description,
+            mode=skill.mode,
+            performance_evidence=perf_evidence,
+            sample_queries="\n".join(skill.examples[:5]),
+        )
 
         self.llm.set_role("skill_refiner")
         try:

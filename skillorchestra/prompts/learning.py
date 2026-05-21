@@ -62,56 +62,6 @@ Return a JSON object with:
 Aim for a taxonomy that covers the FULL DIVERSITY of the sample problems, not just one narrow topic. If problems span temporal facts, entity lookups, numeric data, relational facts, etc., the taxonomy should reflect all of those."""
 
 
-# ---------------------------------------------------------------------------
-# Phase 1a: Skill Discovery - Agent Orchestration
-# ---------------------------------------------------------------------------
-
-AGENT_ORCHESTRATION_DISCOVERY_PROMPT = """You are a skill taxonomist analyzing QA problems to discover the underlying skills required to solve them.
-
-## Stage Information
-We have 3 stages in our pipeline:
-- **search**: Web search to retrieve factual information (tool: search)
-- **code**: Code generation and execution for calculations (tool: enhance_reasoning)
-- **answer**: Generate final answer from context (tool: answer)
-
-## Sample Problems
-{sample_problems}
-
-## Task
-Analyze these problems and DISCOVER what skills are needed.
-Propose a HIERARCHICAL skill taxonomy with:
-1. HIGH-LEVEL CATEGORIES (3-5): Broad skill areas that differentiate problems
-2. FINE-GRAINED SKILLS (2-4 per category): Specific capabilities within each category
-
-## Requirements
-- Skills should capture what makes problems DIFFERENT and what makes MODELS perform differently
-- Skills should be SPECIFIC and MEASURABLE (not vague like "intelligence")
-- Include INDICATORS (keywords/patterns that suggest a skill is needed)
-- Use hierarchical IDs: stage.category.specific_skill
-
-## Output Format (JSON)
-```json
-{{
-  "categories": [
-    {{
-      "stage": "search|code|answer",
-      "name": "category_name",
-      "description": "What this category covers",
-      "skills": [
-        {{
-          "id": "stage.category.skill_name",
-          "name": "Human Readable Name",
-          "description": "What this specific skill involves",
-          "indicators": ["keyword1", "pattern2", "phrase3"],
-          "examples": ["Example query requiring this skill"]
-        }}
-      ]
-    }}
-  ]
-}}
-```
-
-Respond with JSON only."""
 
 
 # ---------------------------------------------------------------------------
@@ -159,7 +109,7 @@ Weights should sum to approximately 1.0. Only include skills that are genuinely 
 MODE_INSIGHT_PROMPT = """You are an expert at analyzing execution patterns to derive reusable routing insights.
 
 ## Task
-Analyze the execution patterns below and derive mode-level routing insights. These insights should help an orchestrator decide WHEN to use each mode and HOW to transition between modes.
+Analyze the execution patterns below and derive mode-level routing insights. These insights should help a router decide WHEN to use each mode and HOW to transition between modes.
 
 ## Execution Patterns
 {execution_patterns}
@@ -290,97 +240,8 @@ Only recommend merging if the skills truly capture the same capability from a ro
 
 
 # ---------------------------------------------------------------------------
-# Phase 2: Agent Orchestration Split/Merge
-# ---------------------------------------------------------------------------
-
-AGENT_ORCHESTRATION_SPLIT_PROMPT = """You are analyzing whether a skill should be split into more fine-grained skills.
-
-## Skill to Analyze
-{skill_definition}
-
-## Performance Data
-{performance_data}
-
-## Sample Queries
-### High Performance Queries (models succeeded)
-{high_perf_queries}
-
-### Low Performance Queries (models failed)
-{low_perf_queries}
-
-### Divergent Performance Queries (some models succeeded, others failed)
-{divergent_queries}
-
-## Sample Trajectories (if available)
-### Successful Trajectories
-{success_trajectories}
-
-### Failed Trajectories
-{failure_trajectories}
-
-## Task
-Analyze whether this skill should be split:
-1. Does the skill have high variance across models? (suggests splitting)
-2. Do different query types show different performance patterns? (suggests splitting)
-3. Are there clear sub-skills that could be distinguished? (suggests splitting)
-
-## Output Format (JSON)
-```json
-{{
-  "should_split": true/false,
-  "rationale": "Why split or not",
-  "proposed_splits": [
-    {{
-      "skill_id": "stage.category.subskill1",
-      "name": "Sub-skill Name",
-      "description": "What this sub-skill covers",
-      "indicators": ["indicator1", "indicator2"],
-      "distinguishing_feature": "What distinguishes this from sibling skills"
-    }}
-  ]
-}}
-```
-
-Respond with JSON only."""
 
 
-AGENT_ORCHESTRATION_MERGE_PROMPT = """You are analyzing whether two skills should be merged.
-
-## Skills to Analyze
-{skills_definitions}
-
-## Performance Correlation
-{performance_correlation}
-
-## Sample Queries
-### Skill 1 Queries
-{skill1_queries}
-
-### Skill 2 Queries
-{skill2_queries}
-
-## Task
-Analyze whether these skills should be merged:
-1. Do they have nearly identical performance patterns across models? (suggests merge)
-2. Are they conceptually similar or overlapping? (suggests merge)
-3. Would merging simplify routing without losing important distinctions? (suggests merge)
-
-## Output Format (JSON)
-```json
-{{
-  "should_merge": true/false,
-  "rationale": "Why merge or not",
-  "merged_skill": {{
-    "skill_id": "stage.category.merged_skill",
-    "name": "Merged Skill Name",
-    "description": "Combined description",
-    "indicators": ["indicator1", "indicator2"]
-  }},
-  "alternative_explanation": "If should_merge=true, use empty string \"\". If should_merge=false, explain why they should remain separate."
-}}
-```
-
-Respond with JSON only."""
 
 
 # ---------------------------------------------------------------------------
