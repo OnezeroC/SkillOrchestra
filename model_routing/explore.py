@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from skillorchestra.routing.pool_service import (
-    call_pool_models_parallel,
+    call_pool_models,
     check_all_servers,
     load_distributed_config,
 )
@@ -69,11 +69,11 @@ def process_sample(
         "timestamp": datetime.now().isoformat(),
     }
 
-    # Call all pool models in parallel
-    parallel_results = call_pool_models_parallel(
+    # Call all pool models in parallel (auto-detects local SGLang vs remote API)
+    parallel_results = call_pool_models(
         pool_models, question,
         max_tokens=max_tokens,
-        max_workers=15,
+        max_workers=3,
     )
 
     for model_key, result in parallel_results.items():

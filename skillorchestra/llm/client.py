@@ -155,7 +155,7 @@ class LLMClient:
         base_url: Optional[str] = None,
         max_tokens: int = 8192,
         max_retries: int = 3,
-        retry_delay: float = 1.0,
+        retry_delay: float = 10.0,
         **provider_kwargs: Any,
     ):
         if not _OPENAI_AVAILABLE:
@@ -214,7 +214,7 @@ class LLMClient:
         if headers:
             client_kwargs["default_headers"] = headers
 
-        self.client = OpenAI(**client_kwargs)
+        self.client = OpenAI(max_retries=0, **client_kwargs)
 
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0

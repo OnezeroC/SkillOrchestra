@@ -77,6 +77,8 @@ class LearningConfig:
     # LLM for learning-critical operations (unified for model routing + agent orchestration)
     learning_llm_model: str = "gpt-5"  # Discovery, refinement, insight, summarization
     skill_id_model: Optional[str] = None  # Skill identification. If None, use learning_llm_model.
+    llm_base_url: str = ""  # Explicit base_url for LLM client (overrides env)
+    llm_api_key: str = ""  # Explicit api_key for LLM client (overrides env)
 
     # Refinement
     split_variance_threshold: float = 0.15
@@ -142,7 +144,15 @@ class LearningPipeline:
 
         skill_id_llm = llm
         if self.config.skill_id_model and self.config.skill_id_model != llm.model:
-            skill_id_llm = LLMClient(model=self.config.skill_id_model)
+            if self.config.llm_base_url and self.config.llm_api_key:
+                skill_id_llm = LLMClient(
+                    model=self.config.skill_id_model,
+                    provider="custom",
+                    base_url=self.config.llm_base_url,
+                    api_key=self.config.llm_api_key,
+                )
+            else:
+                skill_id_llm = LLMClient(model=self.config.skill_id_model)
 
         skill_id_traces_path = self.config.skill_id_traces_path
         if self.config.output_dir and skill_id_traces_path is None:

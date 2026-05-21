@@ -283,7 +283,7 @@ Return a JSON object:
     "description": "Combined description",
     "indicators": ["combined indicators"]
   }},
-  "alternative_explanation": "If not merging, explain why they should remain separate"
+  "alternative_explanation": "If should_merge=true, use empty string \"\". If should_merge=false, explain why they should remain separate."
 }}
 
 Only recommend merging if the skills truly capture the same capability from a routing perspective, even if they differ semantically."""
@@ -376,7 +376,7 @@ Analyze whether these skills should be merged:
     "description": "Combined description",
     "indicators": ["indicator1", "indicator2"]
   }},
-  "alternative_explanation": "If not merging, explain why they should remain separate"
+  "alternative_explanation": "If should_merge=true, use empty string \"\". If should_merge=false, explain why they should remain separate."
 }}
 ```
 

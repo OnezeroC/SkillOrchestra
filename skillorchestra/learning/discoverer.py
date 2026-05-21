@@ -5,6 +5,7 @@ Phase 1a: Skill Discovery via hierarchical taxonomy.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -124,6 +125,9 @@ class SkillDiscoverer:
                             f"Skill discovery attempt {attempt + 1}/3 failed for mode {mode} "
                             f"(queries={bundle_count}): {exc}"
                         )
+                        # Add delay before retry to avoid rate limiting
+                        if attempt < 2:
+                            time.sleep(10 * (attempt + 1))
                         # If prompt is too long, immediately retry with fewer bundles.
                         if self._is_context_length_error(exc) and size_idx < len(bundle_sizes) - 1:
                             next_count = bundle_sizes[size_idx + 1]
@@ -135,6 +139,15 @@ class SkillDiscoverer:
                         if attempt == 2 and size_idx == len(bundle_sizes) - 1:
                             logger.error(f"Skill discovery failed for mode {mode}: {exc}")
                 if output is not None:
+                    # If LLM returned zero categories and smaller bundle sizes remain,
+                    # treat as a soft failure and retry with fewer queries.
+                    if len(output.categories) == 0 and size_idx < len(bundle_sizes) - 1:
+                        logger.warning(
+                            f"Discovery returned 0 categories with {bundle_count} queries; "
+                            f"retrying with fewer queries."
+                        )
+                        output = None
+                        continue
                     break
             if output is None:
                 continue

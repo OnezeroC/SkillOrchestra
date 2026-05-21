@@ -23,7 +23,7 @@ from skillorchestra.routing.pool_service import (
     MODEL_CONFIGS,
     POOL_MODEL_KEYS,
     API_PRICE_1M_TOKENS,
-    call_pool_model,
+    call_pool_model_unified,
     call_router,
     resolve_model_key,
     display_name,
@@ -556,104 +556,96 @@ def run_inference(
     total_cost = 0.0
     per_model_costs: Dict[str, Dict] = {}
     answer = None
+    error_type = "none"
     skill_analysis_parsed = 0
     skill_analysis_failures = 0
     parse_errors = 0
 
-    for turn_idx in range(MAX_TURNS):
-        router_output, r_pt, r_ct = call_router(
-            conversation, router_model,
-            max_tokens=8192, temperature=temperature, seed=seed,
-            stop=["</search>", "</answer>"],
-        )
-        total_router_pt += r_pt
-        total_router_ct += r_ct
+    # Single turn: router classifies skills → system routes → pool model answers
+    router_output, r_pt, r_ct = call_router(
+        conversation, router_model,
+        max_tokens=4096, temperature=temperature, seed=seed,
+        stop=["</skill_analysis>"],
+    )
+    total_router_pt += r_pt
+    total_router_ct += r_ct
 
-        # Track router cost
-        rp = API_PRICE_1M_TOKENS.get(router_model, {"input": 0, "output": 0})
-        r_in_cost = r_pt * rp["input"] / 1_000_000
-        r_out_cost = r_ct * rp["output"] / 1_000_000
-        total_cost += r_in_cost + r_out_cost
-        rkey = f"router:{router_model}"
-        if rkey not in per_model_costs:
-            per_model_costs[rkey] = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
-                                     "input_cost": 0.0, "output_cost": 0.0, "total_cost": 0.0}
-        per_model_costs[rkey]["calls"] += 1
-        per_model_costs[rkey]["prompt_tokens"] += r_pt
-        per_model_costs[rkey]["completion_tokens"] += r_ct
-        per_model_costs[rkey]["input_cost"] += r_in_cost
-        per_model_costs[rkey]["output_cost"] += r_out_cost
-        per_model_costs[rkey]["total_cost"] += r_in_cost + r_out_cost
+    # Track router cost
+    rp = API_PRICE_1M_TOKENS.get(router_model, {"input": 0, "output": 0})
+    r_in_cost = r_pt * rp["input"] / 1_000_000
+    r_out_cost = r_ct * rp["output"] / 1_000_000
+    total_cost += r_in_cost + r_out_cost
+    rkey = f"router:{router_model}"
+    if rkey not in per_model_costs:
+        per_model_costs[rkey] = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                                 "input_cost": 0.0, "output_cost": 0.0, "total_cost": 0.0}
+    per_model_costs[rkey]["calls"] += 1
+    per_model_costs[rkey]["prompt_tokens"] += r_pt
+    per_model_costs[rkey]["completion_tokens"] += r_ct
+    per_model_costs[rkey]["input_cost"] += r_in_cost
+    per_model_costs[rkey]["output_cost"] += r_out_cost
+    per_model_costs[rkey]["total_cost"] += r_in_cost + r_out_cost
 
-        if not router_output:
-            logger.warning(f"Router returned empty for: {question[:60]}")
-            break
+    # Re-attach stop token stripped by SGLang
+    if "<skill_analysis>" in router_output and "</skill_analysis>" not in router_output:
+        router_output += "</skill_analysis>"
 
-        # Re-attach stop tokens stripped by SGLang
-        if "<search>" in router_output and "</search>" not in router_output:
-            router_output += "</search>"
-        if "<answer>" in router_output and "</answer>" not in router_output:
-            router_output += "</answer>"
+    if not router_output.strip():
+        error_type = "router_api_error"
 
-        turn = TurnRecord(turn_idx=turn_idx + 1, action="none",
-                          router_output=router_output,
-                          router_prompt_tokens=r_pt, router_completion_tokens=r_ct)
+    turn = TurnRecord(turn_idx=1, action="none",
+                      router_output=router_output,
+                      router_prompt_tokens=r_pt, router_completion_tokens=r_ct)
 
-        # Check for answer
-        ans = parse_answer(router_output)
-        if ans:
-            turn.action = "answer"
-            turn.routing_decision_logic = "router_provided_answer_directly"
-            answer = ans
-            turns.append(turn)
-            break
+    selected_model = None
+    decision_logic = None
+    answer = ""
 
-        # Skill analysis + routing (first turn only)
-        selected_model = None
-        decision_logic = None
+    # Parse skill analysis from router output
+    sa = parse_skill_analysis(router_output)
+    if sa:
+        skill_analysis_parsed += 1
+        turn.skill_analysis = sa
+        selected_model, decision_logic = route_by_weighted_avg(
+            sa, model_skill_scores,
+            model_overall_rates=model_overall_rates,
+            model_costs=model_costs,
+            skill_id_normalizer=skill_id_normalizer,
+            lambda_c=lambda_c, verbose=verbose)
+    else:
+        # Fallback: keyword/indicator matching
+        skill_analysis_failures += 1
+        ind = identify_skills_by_indicators(question, skill_indicators)
+        if ind:
+            turn.indicator_fallback_analysis = ind
+            selected_model, decision_logic = route_by_weighted_avg(
+                ind, model_skill_scores,
+                model_overall_rates=model_overall_rates,
+                model_costs=model_costs,
+                skill_id_normalizer=skill_id_normalizer,
+                lambda_c=lambda_c, verbose=verbose)
+            if decision_logic:
+                decision_logic += "_indicator_fallback"
 
-        if routing_strategy != "router_decides" and turn_idx == 0:
-            sa = parse_skill_analysis(router_output)
-            if sa:
-                skill_analysis_parsed += 1
-                turn.skill_analysis = sa
-                selected_model, decision_logic = route_by_weighted_avg(
-                    sa, model_skill_scores,
-                    model_overall_rates=model_overall_rates,
-                    model_costs=model_costs,
-                    skill_id_normalizer=skill_id_normalizer,
-                    lambda_c=lambda_c, verbose=verbose)
-            else:
-                skill_analysis_failures += 1
-                ind = identify_skills_by_indicators(question, skill_indicators)
-                if ind:
-                    turn.indicator_fallback_analysis = ind
-                    selected_model, decision_logic = route_by_weighted_avg(
-                        ind, model_skill_scores,
-                        model_overall_rates=model_overall_rates,
-                        model_costs=model_costs,
-                        skill_id_normalizer=skill_id_normalizer,
-                        lambda_c=lambda_c, verbose=verbose)
-                    if decision_logic:
-                        decision_logic += "_indicator_fallback"
-                else:
-                    parse_errors += 1
+    # Call selected pool model
+    if selected_model:
+        mk = resolve_model_key(selected_model)
+        if not mk:
+            mk = resolve_model_key(selected_model.split("-")[0])
 
-        # If routing selected a model, call it via pool_service
-        if selected_model:
-            mk = resolve_model_key(selected_model)
-            if not mk:
-                mk = resolve_model_key(selected_model.split("-")[0])
-
-            result = call_pool_model(mk, question, max_tokens=max_pool_tokens,
+        if mk:
+            result = call_pool_model_unified(mk, question, max_tokens=max_pool_tokens,
                                      temperature=temperature, seed=seed)
-            turn.action = "search"
+            turn.action = "routed"
             turn.routed_model = selected_model
             turn.routed_query = question
             turn.routed_response = result.response
             turn.cost = result.cost.total
             turn.routing_decision_logic = decision_logic
             models_called.append(selected_model)
+            answer = result.response or ""
+            if not result.success and error_type == "none":
+                error_type = f"pool_api_error:{result.error}" if result.error else "pool_api_error"
 
             total_pool_pt += result.cost.prompt_tokens
             total_pool_ct += result.cost.completion_tokens
@@ -669,50 +661,7 @@ def run_inference(
             per_model_costs[mk]["output_cost"] += result.cost.output_cost
             per_model_costs[mk]["total_cost"] += result.cost.total
 
-            conversation += router_output
-            resp_text = result.response[:2000] if result.response else ""
-            conversation += f"\n\n<information>{resp_text}</information>\n\n"
-            turns.append(turn)
-            continue
-
-        # Fallback: parse <search> tag from router output
-        search = parse_search(router_output, question)
-        if search:
-            model_name, query = search
-            mk = resolve_model_key(model_name)
-            if mk:
-                result = call_pool_model(mk, question, max_tokens=max_pool_tokens,
-                                         temperature=temperature, seed=seed)
-                turn.action = "search"
-                turn.routed_model = model_name
-                turn.routed_query = question
-                turn.routed_response = result.response
-                turn.cost = result.cost.total
-                turn.routing_decision_logic = "router_decides"
-                models_called.append(model_name)
-
-                total_pool_pt += result.cost.prompt_tokens
-                total_pool_ct += result.cost.completion_tokens
-                total_cost += result.cost.total
-
-                if mk not in per_model_costs:
-                    per_model_costs[mk] = {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
-                                           "input_cost": 0.0, "output_cost": 0.0, "total_cost": 0.0}
-                per_model_costs[mk]["calls"] += 1
-                per_model_costs[mk]["prompt_tokens"] += result.cost.prompt_tokens
-                per_model_costs[mk]["completion_tokens"] += result.cost.completion_tokens
-                per_model_costs[mk]["input_cost"] += result.cost.input_cost
-                per_model_costs[mk]["output_cost"] += result.cost.output_cost
-                per_model_costs[mk]["total_cost"] += result.cost.total
-
-                conversation += router_output
-                resp_text = result.response[:2000] if result.response else ""
-                conversation += f"\n\n<information>{resp_text}</information>\n\n"
-                turns.append(turn)
-                continue
-
-        turns.append(turn)
-        break
+    turns.append(turn)
 
     if answer is None:
         answer = ""
@@ -757,6 +706,7 @@ def run_inference(
         "exact_match": em,
         "f1": f1,
         "success": em > 0 or f1 > 0.5,
+        "error_type": error_type,
         "errors": {
             "skill_analysis_parsed_successfully": skill_analysis_parsed,
             "skill_analysis_parse_failures": skill_analysis_failures,
@@ -801,7 +751,7 @@ def main():
     parser.add_argument("--lambda-c", type=float, default=0.01,
                         help="Cost penalty weight for probabilistic model selection")
     parser.add_argument("--distributed-config", type=str, default=None)
-    parser.add_argument("--num-workers", type=int, default=15,
+    parser.add_argument("--num-workers", type=int, default=3,
                         help="Number of parallel workers for sample processing (1=sequential)")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -893,6 +843,15 @@ def main():
     elapsed = time.time() - t0
     n = len(results)
 
+    # Count API errors
+    error_counts: Dict[str, int] = {}
+    for r in results:
+        et = r.get("error_type", "none")
+        error_counts[et] = error_counts.get(et, 0) + 1
+    valid_results = [r for r in results if r.get("error_type") == "none"]
+    n_valid = len(valid_results)
+    total_em_valid = sum(r["exact_match"] for r in valid_results)
+
     # Aggregate costs and tokens from all results
     total_cost = sum(r.get("costs", {}).get("total", 0.0) for r in results)
     total_router_pt = sum(r.get("tokens", {}).get("router_prompt", 0) for r in results)
@@ -937,6 +896,9 @@ def main():
         "num_samples": n,
         "exact_match": round(total_em / n, 4) if n else 0,
         "f1": round(total_f1 / n, 4) if n else 0,
+        "error_counts": error_counts,
+        "valid_samples": n_valid,
+        "exact_match_valid": round(total_em_valid / n_valid, 4) if n_valid else 0,
         "elapsed_seconds": round(elapsed, 1),
         "timestamp": datetime.now().isoformat(),
         # Aggregate cost & tokens
@@ -966,6 +928,9 @@ def main():
         f"\nResults: EM={summary['exact_match']:.4f} F1={summary['f1']:.4f} "
         f"cost=${summary['total_cost_usd']:.4f} ({n} samples, {elapsed:.0f}s)"
     )
+    if error_counts:
+        logger.info(f"Errors: {error_counts}")
+        logger.info(f"Valid samples: {n_valid}/{n}, EM_valid={summary['exact_match_valid']:.4f}")
     logger.info(f"Saved to {out_dir}")
 
 

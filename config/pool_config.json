@@ -1,23 +1,17 @@
 {
   "default_host": "10.144.9.132",
   "models": {
-    "qwen2.5-7b-instruct": {
-      "model_path": "Qwen/Qwen2.5-7B-Instruct",
+    "qwen3-next-80b-a3b-instruct": {
+      "model_path": "qwen/qwen3-next-80b-a3b-instruct",
       "port": 30006,
-      "display_name": "Qwen2.5-7B-Instruct",
-      "env_host": "SGLANG_QWEN7B_HOST"
+      "display_name": "Qwen3-Next-80B-A3B-Instruct",
+      "env_host": "SGLANG_QWEN3_HOST"
     },
     "llama3.1-8b-instruct": {
       "model_path": "meta-llama/Llama-3.1-8B-Instruct",
       "port": 30001,
       "display_name": "LLaMA-3.1-8B-Instruct",
       "env_host": "SGLANG_LLAMA8B_HOST"
-    },
-    "llama3.1-70b-instruct": {
-      "model_path": "meta-llama/Llama-3.1-70B-Instruct",
-      "port": 30002,
-      "display_name": "LLaMA-3.1-70B-Instruct",
-      "env_host": "SGLANG_LLAMA70B_HOST"
     },
     "mistral-7b-instruct": {
       "model_path": "mistralai/Mistral-7B-Instruct-v0.3",
@@ -45,17 +39,15 @@
     }
   },
   "pool_model_keys": [
-    "qwen2.5-7b-instruct",
+    "qwen3-next-80b-a3b-instruct",
     "llama3.1-8b-instruct",
-    "llama3.1-70b-instruct",
     "mistral-7b-instruct",
     "mixtral-8x22b-instruct",
     "gemma2-27b-it"
   ],
   "pricing": {
-    "qwen2.5-7b-instruct": {"input": 0.0375, "output": 0.30},
+    "qwen3-next-80b-a3b-instruct": {"input": 0.0375, "output": 0.30},
     "llama3.1-8b-instruct": {"input": 0.0225, "output": 0.18},
-    "llama3.1-70b-instruct": {"input": 0.11, "output": 0.88},
     "mistral-7b-instruct": {"input": 0.025, "output": 0.20},
     "mixtral-8x22b-instruct": {"input": 0.15, "output": 1.20},
     "gemma2-27b-it": {"input": 0.10, "output": 0.80},

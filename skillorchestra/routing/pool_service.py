@@ -7,6 +7,7 @@ Calls pool models via the OpenAI-compatible /v1/chat/completions endpoint,
 from __future__ import annotations
 
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -237,48 +238,280 @@ def call_router(
     stop: Optional[List[str]] = None,
     timeout: int = 120,
 ) -> Tuple[str, int, int]:
-    """Call the router model via raw /generate (Qwen handles raw text fine).
+    """Call the router model — local SGLang preferred, API fallback.
 
     Returns (response_text, prompt_tokens, completion_tokens).
     """
-    if model_key not in MODEL_CONFIGS:
-        raise ValueError(f"Unknown model: {model_key}")
+    # Try local SGLang first
+    local_ok = False
+    if model_key in MODEL_CONFIGS:
+        cfg = MODEL_CONFIGS[model_key]
+        host = cfg.get("ip_addr", DEFAULT_HOST)
+        try:
+            r = requests.get(f"http://{host}:{cfg['port']}/health", timeout=2)
+            local_ok = (r.status_code == 200)
+        except Exception:
+            pass
 
-    cfg = MODEL_CONFIGS[model_key]
-    host = cfg.get("ip_addr", DEFAULT_HOST)
-    url = f"http://{host}:{cfg['port']}/generate"
+    if local_ok:
+        cfg = MODEL_CONFIGS[model_key]
+        host = cfg.get("ip_addr", DEFAULT_HOST)
+        url = f"http://{host}:{cfg['port']}/generate"
 
-    sampling_params: Dict[str, Any] = {
-        "max_new_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": 0.9 if temperature > 0 else 1.0,
-    }
-    if seed is not None:
-        sampling_params["sampling_seed"] = seed
-    if stop:
-        sampling_params["stop"] = stop
-
-    try:
-        resp = requests.post(url, json={"text": prompt, "sampling_params": sampling_params},
-                             timeout=timeout)
-        resp.raise_for_status()
-        data = resp.json()
-        text = data.get("text", "")
-        meta = data.get("meta_info", {})
-        pt = meta.get("prompt_tokens", len(prompt) // 4)
-        ct = meta.get("completion_tokens", len(text) // 4)
-
+        sampling_params: Dict[str, Any] = {
+            "max_new_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": 0.9 if temperature > 0 else 1.0,
+        }
+        if seed is not None:
+            sampling_params["sampling_seed"] = seed
         if stop:
-            for s in stop:
-                if s.lstrip("<") in text and s not in text:
-                    text = text + s
+            sampling_params["stop"] = stop
 
-        return text, pt, ct
-    except Exception as e:
-        logger.error(f"[router:{model_key}] error: {e}")
-        return "", 0, 0
+        try:
+            resp = requests.post(url, json={"text": prompt, "sampling_params": sampling_params},
+                                 timeout=timeout)
+            resp.raise_for_status()
+            data = resp.json()
+            text = data.get("text", "")
+            meta = data.get("meta_info", {})
+            pt = meta.get("prompt_tokens", len(prompt) // 4)
+            ct = meta.get("completion_tokens", len(text) // 4)
+
+            if stop:
+                for s in stop:
+                    if s.lstrip("<") in text and s not in text:
+                        text = text + s
+
+            return text, pt, ct
+        except Exception as e:
+            logger.error(f"[router:{model_key}] local error: {e}, falling back to API")
+            # Fall through to API
+
+    # API fallback: router uses OpenRouter (separate from pool models using NVIDIA)
+    logger.info(f"[router:{model_key}] using API fallback")
+    provider = _get_router_api_provider()
+    if provider is not None:
+        result = provider.call_pool_model(
+            model_key=model_key, query=prompt,
+            max_tokens=max_tokens, temperature=temperature,
+            seed=seed, prompt_template="{query}",
+        )
+        if result.success:
+            return result.response, result.cost.prompt_tokens, result.cost.completion_tokens
+        logger.error(f"[router:{model_key}] API error: {result.error}")
+    return "", 0, 0
 
 
 def calculate_cost(model_key: str, prompt_tokens: int, completion_tokens: int) -> float:
     prices = API_PRICE_1M_TOKENS.get(model_key, {"input": 0, "output": 0})
     return prompt_tokens * prices["input"] / 1_000_000 + completion_tokens * prices["output"] / 1_000_000
+
+
+# ---------------------------------------------------------------------------
+# API-based pool model calling (migrated from Router-R1 route_service)
+# ---------------------------------------------------------------------------
+
+# Backend mode: "local" (SGLang) or "api" (OpenRouter/NVIDIA NIM)
+# Auto-detected: if OPENAI_BASE_URL or base_url env var is set, use "api"
+_POOL_BACKEND: Optional[str] = None
+_api_provider: Any = None  # Lazy-loaded APIPoolProvider (pool models)
+_router_api_provider: Any = None  # Lazy-loaded APIPoolProvider (router, uses OpenRouter)
+
+
+def _detect_backend() -> str:
+    """Detect which pool backend to use based on environment.
+
+    Checks: legacy env vars (OPENAI_BASE_URL) → unified config (api_models.json) → local.
+    """
+    global _POOL_BACKEND
+    if _POOL_BACKEND is not None:
+        return _POOL_BACKEND
+
+    api_base = os.environ.get("OPENAI_BASE_URL", os.environ.get("base_url", ""))
+    api_key = os.environ.get("OPENAI_API_KEY", os.environ.get("api_key", ""))
+
+    if api_base and api_key:
+        _POOL_BACKEND = "api"
+        logger.info("Pool backend: api (legacy env vars)")
+    elif os.path.exists(_API_CONFIG_PATH):
+        _POOL_BACKEND = "api"
+        logger.info("Pool backend: api (unified config api_models.json)")
+    else:
+        _POOL_BACKEND = "local"
+        logger.info("Pool backend: local (SGLang servers)")
+
+    return _POOL_BACKEND
+
+
+_API_CONFIG_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+    "config", "api_models.json",
+)
+
+
+def _get_api_provider() -> Any:
+    """Lazy-load the API provider for pool models.
+
+    Prefers unified config (api_models.json) when available.
+    Falls back to legacy env vars (OPENAI_BASE_URL / OPENAI_API_KEY).
+    """
+    global _api_provider
+    if _api_provider is None:
+        from skillorchestra.routing.api_provider import APIPoolProvider
+        if os.path.exists(_API_CONFIG_PATH):
+            logger.info("Pool API provider: unified config (api_models.json)")
+            _api_provider = APIPoolProvider(prompt_template=POOL_PROMPT)
+        else:
+            base_url = os.environ.get("OPENAI_BASE_URL", os.environ.get("base_url", ""))
+            api_key = os.environ.get("OPENAI_API_KEY", os.environ.get("api_key", ""))
+            model_map = "nvidia" if "nvidia" in base_url.lower() else "openrouter"
+            logger.info("Pool API provider: legacy (%s)", model_map)
+            _api_provider = APIPoolProvider(
+                base_url=base_url, api_key=api_key,
+                model_map=model_map, prompt_template=POOL_PROMPT,
+            )
+    return _api_provider
+
+
+def _get_router_api_provider() -> Any:
+    """Lazy-load the router's API provider.
+
+    Priority: unified config (api_models.json) — supports MiniMax, NVIDIA, OpenRouter.
+    Falls back to legacy: NVIDIA NIM → OpenRouter.
+
+    Config mode lets router models specify their own provider (e.g. minimax-m2.7
+    uses MiniMax API). Add or change router models by editing api_models.json
+    and setting the corresponding API key env var — no code changes needed.
+    """
+    global _router_api_provider
+    if _router_api_provider is None:
+        from skillorchestra.routing.api_provider import APIPoolProvider
+        if os.path.exists(_API_CONFIG_PATH):
+            logger.info("Router API provider: unified config (api_models.json)")
+            _router_api_provider = APIPoolProvider(prompt_template="{query}")
+        else:
+            nvidia_base = os.environ.get("OPENAI_BASE_URL", "")
+            nvidia_key = os.environ.get("OPENAI_API_KEY", "")
+            if nvidia_base and nvidia_key:
+                logger.info("Router API provider: NVIDIA NIM (legacy)")
+                _router_api_provider = APIPoolProvider(
+                    base_url=nvidia_base, api_key=nvidia_key,
+                    model_map="nvidia", prompt_template="{query}",
+                )
+            else:
+                openrouter_base = os.environ.get("OPENROUTER_BASE_URL", "")
+                openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+                if openrouter_base and openrouter_key:
+                    logger.info("Router API provider: OpenRouter (legacy)")
+                    _router_api_provider = APIPoolProvider(
+                        base_url=openrouter_base, api_key=openrouter_key,
+                        model_map="openrouter", prompt_template="{query}",
+                    )
+                else:
+                    logger.warning("Router API provider: no credentials found")
+    return _router_api_provider
+
+
+def call_pool_models(
+    model_keys: List[str],
+    query: str,
+    *,
+    max_tokens: int = 1024,
+    temperature: float = 0.6,
+    seed: Optional[int] = None,
+    max_workers: int = 15,
+    prompt_template: str = POOL_PROMPT,
+) -> Dict[str, PoolCallResult]:
+    """Unified pool model calling: auto-detects local SGLang vs remote API.
+
+    When OPENAI_BASE_URL/base_url and OPENAI_API_KEY/api_key env vars are set,
+    uses external API calls (migrated from Router-R1 route_service).
+    Otherwise, uses local SGLang servers (original behavior).
+
+    Args:
+        model_keys: List of model keys to call
+        query: The question/prompt
+        max_tokens: Max tokens per response
+        temperature: Sampling temperature
+        seed: Random seed
+        max_workers: Max parallel workers
+        prompt_template: Prompt format string
+
+    Returns:
+        Dict mapping model_key → PoolCallResult
+    """
+    backend = _detect_backend()
+
+    if backend == "api":
+        provider = _get_api_provider()
+        return provider.call_pool_models_parallel(
+            model_keys=model_keys,
+            query=query,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
+            max_workers=max_workers,
+            prompt_template=prompt_template,
+        )
+    else:
+        return call_pool_models_parallel(
+            model_keys=model_keys,
+            query=query,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
+            max_workers=max_workers,
+            prompt_template=prompt_template,
+        )
+
+
+def call_pool_model_unified(
+    model_key: str,
+    query: str,
+    *,
+    max_tokens: int = 1024,
+    temperature: float = 0.6,
+    seed: Optional[int] = None,
+    timeout: int = 120,
+    max_retries: int = 3,
+    prompt_template: str = POOL_PROMPT,
+) -> PoolCallResult:
+    """Unified single pool model call: auto-detects local SGLang vs remote API.
+
+    Args:
+        model_key: Model key to call
+        query: The question/prompt
+        max_tokens: Max tokens per response
+        temperature: Sampling temperature
+        seed: Random seed
+        timeout: Request timeout (local mode only)
+        max_retries: Max retries (local mode only)
+        prompt_template: Prompt format string
+
+    Returns:
+        PoolCallResult
+    """
+    backend = _detect_backend()
+
+    if backend == "api":
+        provider = _get_api_provider()
+        return provider.call_pool_model(
+            model_key=model_key,
+            query=query,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
+            prompt_template=prompt_template,
+        )
+    else:
+        return call_pool_model(
+            model_key=model_key,
+            query=query,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            seed=seed,
+            timeout=timeout,
+            max_retries=max_retries,
+            prompt_template=prompt_template,
+        )

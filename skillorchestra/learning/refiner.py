@@ -61,7 +61,7 @@ class MergeOutput(BaseModel):
     should_merge: bool = False
     rationale: str = ""
     merged_skill: Optional[MergedSkillDef] = None
-    alternative_explanation: str = ""  # When not merging: why they should remain separate
+    alternative_explanation: Optional[str] = ""  # When not merging: why they should remain separate (None if merging)
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +362,7 @@ Examples: {', '.join(s2.examples[:3])}"""
                 skill_id_2=s2.skill_id,
                 applied=output.should_merge,
                 rationale=output.rationale,
-                alternative_explanation=output.alternative_explanation,
+                alternative_explanation=output.alternative_explanation or "",
                 merged_skill_id=output.merged_skill.skill_id if output.merged_skill else None,
             )
 

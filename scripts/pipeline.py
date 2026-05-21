@@ -221,7 +221,7 @@ class PipelineConfig:
 
     # Learning
     use_llm: bool = True
-    llm_model: str = "gpt-5"
+    llm_model: str = "deepseek/deepseek-v4-pro"
     skill_id_model: Optional[str] = None  # Skill identification. If None, use llm_model.
     val_ratio: float = 0.3
     min_val_samples: int = 20  # Minimum validation samples for selection
@@ -283,8 +283,14 @@ def phase_explore_model_routing(config: PipelineConfig) -> Path:
     explore_dir = (Path(config.output_dir) / "exploration").resolve()
     explore_dir.mkdir(parents=True, exist_ok=True)
 
+    # Use conda so_env python (guarantees all deps like sympy, openai are available)
+    _conda_prefix = os.environ.get("CONDA_PREFIX", "")
+    _python_exe = os.path.join(_conda_prefix, "bin", "python") if _conda_prefix else sys.executable
+    if not os.path.exists(_python_exe):
+        _python_exe = sys.executable
+
     cmd = [
-        sys.executable, str(Path(__file__).parent.parent / "model_routing" / "explore.py"),
+        _python_exe, str(Path(__file__).parent.parent / "model_routing" / "explore.py"),
         "--dataset", config.dataset,
         "--output-dir", str(explore_dir),
     ]
@@ -298,15 +304,28 @@ def phase_explore_model_routing(config: PipelineConfig) -> Path:
     logger.info(f"Running exploration: {' '.join(cmd)}")
     # Run from repo_root so paths and imports resolve correctly
     repo_root = Path(__file__).resolve().parent.parent
+    # Pass explicit environment: inherit parent but unset conflicting shell vars
+    # to ensure .env settings (OPENAI_BASE_URL / OPENAI_API_KEY) take effect
+    child_env = os.environ.copy()
+    child_env.pop("base_url", None)
+    child_env.pop("api_key", None)
     result = subprocess.run(
         cmd,
         cwd=str(repo_root),
         capture_output=True, text=True, timeout=14400,
+        env=child_env,
     )
 
     if result.returncode != 0:
         logger.error(f"Exploration failed:\n{result.stdout[-1000:]}\n{result.stderr[-1000:]}")
         raise RuntimeError(f"Exploration failed with exit code {result.returncode}")
+
+    # Log subprocess output for debugging (even on success)
+    if result.stderr.strip():
+        for line in result.stderr.strip().split("\n"):
+            line = line.strip()
+            if line:
+                logger.debug(f"[explore] {line}")
 
     results_file = explore_dir / "inference_results.jsonl"
     if results_file.exists():
@@ -490,7 +509,13 @@ def _learn_with_llm(
     from skillorchestra.llm.client import LLMClient
     from skillorchestra.learning.pipeline import LearningPipeline, LearningConfig
 
-    llm = LLMClient(model=config.llm_model)
+    openrouter_url = os.environ.get("OPENROUTER_BASE_URL", "")
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if openrouter_url and openrouter_key:
+        llm = LLMClient(model=config.llm_model, provider="custom", base_url=openrouter_url, api_key=openrouter_key)
+    else:
+        llm = LLMClient(model=config.llm_model)
+
     discovery_prompt = "agent_orchestration" if config.task_type == "frames" else "model_routing"
     lconfig = LearningConfig(
         validation_ratio=0.5,
@@ -501,6 +526,8 @@ def _learn_with_llm(
         discovery_prompt_type=discovery_prompt,
         learning_llm_model=config.llm_model,
         skill_id_model=config.skill_id_model,
+        llm_base_url=openrouter_url,
+        llm_api_key=openrouter_key,
         output_dir=str(Path(config.output_dir) / "learning"),
         experiment_name=config.experiment_name,
         # Orchestration: use real eval script for routing accuracy
@@ -650,7 +677,7 @@ def _evaluate_candidates_live_model_routing(
                 cwd=str(repo_root),
                 capture_output=True,
                 text=True,
-                timeout=600,
+                timeout=7200,
             )
             if proc.returncode != 0:
                 logger.warning(
@@ -906,9 +933,6 @@ def phase_select(
             "Selection requires live evaluation (val data + eval_script). "
             "Oracle is reference only and is never used for selection."
         )
-        best, all_results = select_pareto_optimal(
-            candidates, val_bundles, lambda_cost=config.lambda_cost,
-        )
 
     store.save_evaluation_results(
         [r.to_dict() for r in all_results], exp_name, "selection_results.json",
@@ -1002,7 +1026,7 @@ def phase_test_model_routing(
         cmd,
         cwd=str(repo_root),
         env=env,
-        capture_output=True, text=True, timeout=7200,
+        capture_output=True, text=True, timeout=14400,
     )
 
     if result.returncode != 0:
@@ -1373,6 +1397,16 @@ def run_pipeline(config: PipelineConfig) -> Dict[str, Any]:
     )
     handbook: Optional[SkillHandbook] = None
     selected: Optional[CandidateHandbook] = None
+
+    # Skip learning/selection/testing when only exploration is requested
+    _skip_post_explore = (
+        "learn" not in config.phases
+        and "select" not in config.phases
+        and "test" not in config.phases
+    )
+    if _skip_post_explore:
+        logger.info("Skipping learn/select/test — explore-only run")
+        return results
     if not test_only_with_handbook:
         if "learn" in config.phases:
             handbook = phase_learn(config, train_bundles + val_bundles, store)
@@ -1463,9 +1497,7 @@ def _copy_results_to_output(
     def _copy_dir(src: Path, dst_name: str) -> None:
         dst = results_dir / dst_name
         if src.exists():
-            if dst.exists():
-                shutil.rmtree(dst)
-            shutil.copytree(src, dst)
+            shutil.copytree(src, dst, dirs_exist_ok=True)
             logger.info(f"Copied {dst_name}/ -> results/{dst_name}/")
 
     def _copy_file(src: Path, dst_name: str) -> None:
@@ -1582,7 +1614,7 @@ def _load_bundles(
         if exploration_path.is_file() and exploration_path.suffix == ".jsonl":
             bundles = load_rsl_results(exploration_path, config.max_train_samples)
             stats = rsl_stats(bundles)
-            logger.info(f"RSL stats: {json.dumps(stats, indent=2)[:500]}")
+            logger.info(f"RSL stats: {json.dumps(stats, indent=2)}")
             return bundles
         existing = find_rsl_results(exploration_path, config.dataset)
         if existing:
@@ -1752,7 +1784,7 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
 
     parser.add_argument("--no-llm", action="store_true",
                          help="Skip LLM calls, use manual skills for testing")
-    parser.add_argument("--llm-model", type=str, default="gpt-5",
+    parser.add_argument("--llm-model", type=str, default="deepseek/deepseek-v4-pro",
                          help="LLM model for learning")
     parser.add_argument("--skill-id-model", type=str, default=None,
                          help="LLM for skill identification (default: same as --llm-model). Use gpt-5 for best competence estimates.")
@@ -1864,9 +1896,10 @@ def main():
         config.concurrency = args.concurrency
         config.tool_concurrency = getattr(args, "tool_concurrency", 10)
         config.handbook_path = getattr(args, "handbook", None)
-        # Default: first 30 samples for exploration when running explore phase
-        if "explore" in config.phases and config.exploration_samples is None:
-            config.exploration_samples = 30
+
+    # Default: first 30 samples for exploration when running explore phase
+    if "explore" in config.phases and config.exploration_samples is None:
+        config.exploration_samples = 30
 
     logger.info("=" * 70)
     logger.info("SkillOrchestra Full Pipeline")

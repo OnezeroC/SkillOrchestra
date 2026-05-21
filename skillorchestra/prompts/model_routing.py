@@ -1,64 +1,32 @@
 """Prompt templates for model routing (skill-based and baseline)."""
 
-SKILL_ANALYSIS_PROMPT = """You are a skill-based model router. You are selecting the best model to answer a question by analyzing a question to identify required skills and their importance related to this question.
+SKILL_ANALYSIS_PROMPT = """You are a skill classifier. Given a question, identify which skills from the catalog below are required to answer it, and assign importance weights to each skill.
 
-## Learned Skill Definitions (from validation)
+## Skill Catalog
 {skill_catalog}
 
-## Model Performance (learned from validation)
+## Model Performance Reference
 {model_performance}
 
-## Cost Tiers (cheapest to most expensive)
-- Cheap: Qwen2.5-7B-Instruct, LLaMA-3.1-8B-Instruct, Mistral-7B-Instruct
-- Medium: Gemma-2-27B-Instruct
-- Expensive: LLaMA-3.1-70B-Instruct, Mixtral-8x22B-Instruct
-
 ## Task
-1. First, analyze the question below and identify which skills are needed, along with the percentage/weight of each skill (how important each skill is for answering this question).
-
-**IMPORTANT: Output your skill analysis FIRST, before any <think> tags.** Use the exact skill_id values from the catalog above (e.g. "disambiguation_and_scope.ambiguous_media_title_resolution").
+Analyze the question and identify the required skills with percentage weights (summing to ~100). Output ONLY the JSON block below — no other text, no reasoning outside the JSON, no answer to the question.
 
 <skill_analysis>
 {{
   "required_skills": [
     {{"skill_id": "category.skill_id", "percentage": 50}},
     {{"skill_id": "category.skill_id", "percentage": 30}},
-    ...
+    {{"skill_id": "category.skill_id", "percentage": 20}}
   ],
   "reasoning": "Brief explanation of why these skills are needed"
 }}
 </skill_analysis>
 
-The percentages should sum to approximately 100 (they don't need to be exact, but should reflect relative importance).
-
-2. After providing the skill analysis, reflect on which model is best suited based on the skills required and model performance data above.
-
-3. Route to that model using <search> tags and provide final answer in <answer>...</answer>
-
-Every time you receive new information, you must first conduct reasoning inside <think> ... </think>. \
-After reasoning, if you find you lack some knowledge, you can call a specialized LLM by writing a query inside <search> LLM-Name:Your-Query </search>. \
-
-!!! STRICT FORMAT RULES for <search>: !!!
-    + You MUST replace LLM-Name with the EXACT name of a model selected from [Qwen2.5-7B-Instruct, LLaMA-3.1-8B-Instruct, LLaMA-3.1-70B-Instruct, Mistral-7B-Instruct, Mixtral-8x22B-Instruct, Gemma-2-27B-Instruct]. \
-    + You MUST replace Your-Query with the EXACT same question as the original question below (DO NOT CHANGE IT). \
-    + NEVER copy or paste model descriptions into <search>.
-    + NEVER output the placeholder format <search> LLM-Name:Your-Query </search>. Always replace both parts correctly. \
-
-Before each LLM call, you MUST explicitly reason inside <think> ... </think> about: \
-    + Why external information is needed. \
-    + Which skills from the catalog are required for this question. \
-    + Which model is best suited based on the model performance data above. \
-
-When you call an LLM, the response will be returned between <information> and </information>. \
-You are encouraged to explore and utilize different LLMs to better understand their respective strengths and weaknesses. \
-
-If you find that no further external knowledge is needed, you can directly provide your final answer to the original question inside <answer> ... </answer>, without additional explanation or illustration. \
-For example: <answer> Beijing </answer>. \
-    + Important: You must not output the placeholder text "<answer> and </answer>" alone. \
-    + You must insert your actual answer between <answer> and </answer>, following the correct format. \
-    + You must not output the model name or query between <answer> and </answer>. \
-
-If you think none of the models listed have the necessary skills to answer this question directly, you can route to the model with the highest overall pass rate of models in the pool to get more information.
+Rules:
+- Use exact skill_id values from the catalog.
+- Percentages should sum to approximately 100.
+- Output ONLY the <skill_analysis> block. Do NOT include <think>, <search>, <answer>, or any other tags.
+- Do NOT attempt to answer the question. Your job is only to classify which skills are needed.
 
 Question: {question}
 """
