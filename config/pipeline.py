@@ -28,8 +28,9 @@ RSL_RESULTS_DIR = DATA_DIR / "rsl_results"
 
 # Pool models for model routing
 DEFAULT_POOL_MODELS = [
-    "qwen3-next-80b-a3b-instruct",
+    "qwen2.5-7b-instruct",
     "llama3.1-8b-instruct",
+    "llama3.1-70b-instruct",
     "mistral-7b-instruct",
     "mixtral-8x22b-instruct",
     "gemma2-27b-it",

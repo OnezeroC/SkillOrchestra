@@ -112,8 +112,8 @@ def call_pool_model(
     max_tokens: int = 1024,
     temperature: float = 0.6,
     seed: Optional[int] = None,
-    timeout: int = 120,
-    max_retries: int = 3,
+    timeout: int = 300,
+    max_retries: int = 5,
     prompt_template: str = POOL_PROMPT,
 ) -> PoolCallResult:
     """Call a single pool model via /v1/chat/completions.
@@ -236,7 +236,7 @@ def call_router(
     temperature: float = 0.6,
     seed: Optional[int] = None,
     stop: Optional[List[str]] = None,
-    timeout: int = 120,
+    timeout: int = 300,
 ) -> Tuple[str, int, int]:
     """Call the router model — local SGLang preferred, API fallback.
 
@@ -473,8 +473,8 @@ def call_pool_model_unified(
     max_tokens: int = 1024,
     temperature: float = 0.6,
     seed: Optional[int] = None,
-    timeout: int = 120,
-    max_retries: int = 3,
+    timeout: int = 300,
+    max_retries: int = 5,
     prompt_template: str = POOL_PROMPT,
 ) -> PoolCallResult:
     """Unified single pool model call: auto-detects local SGLang vs remote API.

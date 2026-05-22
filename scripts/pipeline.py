@@ -326,7 +326,6 @@ def _learn_with_llm(
         max_merge_credits=config.max_merge_credits,
         max_split_credits=config.max_split_credits,
         max_discovery_bundles=config.max_discovery_bundles,
-        discovery_prompt_type="model_routing",
         learning_llm_model=config.llm_model,
         skill_id_model=config.skill_id_model,
         llm_base_url=openrouter_url,

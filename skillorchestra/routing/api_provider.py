@@ -143,9 +143,9 @@ class APIPoolProvider:
         *,
         config_path: Optional[str] = None,
         model_map: str | Dict[str, Tuple[str, float, int, float]] = "openrouter",
-        max_retries: int = 2,
-        timeout: int = 60,
-        max_trials: int = 5,
+        max_retries: int = 3,
+        timeout: int = 180,
+        max_trials: int = 8,
         time_gap: float = 10.0,
         prompt_template: str = SIMPLE_PROMPT_TEMPLATE,
     ):
